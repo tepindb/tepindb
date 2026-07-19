@@ -1406,6 +1406,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tepin"
+version = "0.1.0"
+dependencies = [
+ "tepindb",
+]
+
+[[package]]
 name = "tepin-cli"
 version = "0.1.0"
 dependencies = [

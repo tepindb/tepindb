@@ -1,0 +1,18 @@
+# Alias crate: holds the `tepin` name on crates.io and points users at the
+# real entry points. Deliberately slim — no default features, so depending
+# on `tepin` never pulls in ONNX by accident.
+[package]
+name = "tepin"
+description = "Alias for the TepinDB AI-first single-file database — use the tepindb crate (library) or tepin-cli (the tepin CLI binary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+embedding = ["tepindb/embedding"]
+
+[dependencies]
+tepindb = { path = "../tepindb", version = "0.1.0", default-features = false }
