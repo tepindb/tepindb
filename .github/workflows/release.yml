@@ -186,7 +186,9 @@ jobs:
         run: |
           V="${RELEASE_TAG#v}"
           for c in tepin-core tepin-embed tepindb tepin-cli tepin; do
-            if curl -sf "https://crates.io/api/v1/crates/$c/$V" > /dev/null; then
+            # crates.io rejects UA-less requests, which would false-negative
+            # the skip check and re-publish into an "already exists" error.
+            if curl -sf -A "tepindb-release-workflow" "https://crates.io/api/v1/crates/$c/$V" > /dev/null; then
               echo "$c $V already on crates.io — skipping"
               continue
             fi
