@@ -1,0 +1,24 @@
+{
+  "name": "tepin",
+  "version": "0.0.0-dev",
+  "description": "Alias for the tepindb package — the tepin CLI (npx tepin)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tepindb/tepindb.git"
+  },
+  "homepage": "https://github.com/tepindb/tepindb#readme",
+  "bugs": "https://github.com/tepindb/tepindb/issues",
+  "bin": {
+    "tepin": "bin/tepin.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "tepindb": "0.0.0-dev"
+  }
+}

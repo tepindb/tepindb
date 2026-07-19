@@ -1,0 +1,35 @@
+{
+  "name": "tepindb",
+  "version": "0.0.0-dev",
+  "description": "AI-first single-file database for CLI tools and agents — the tepin CLI (npx tepindb)",
+  "keywords": [
+    "database",
+    "embedded",
+    "vector-search",
+    "mcp",
+    "ai",
+    "cli",
+    "tepin"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tepindb/tepindb.git"
+  },
+  "homepage": "https://github.com/tepindb/tepindb#readme",
+  "bugs": "https://github.com/tepindb/tepindb/issues",
+  "bin": {
+    "tepin": "bin/tepin.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "optionalDependencies": {
+    "@tepindb/darwin-arm64": "0.0.0-dev",
+    "@tepindb/linux-x64": "0.0.0-dev",
+    "@tepindb/win32-x64": "0.0.0-dev"
+  }
+}

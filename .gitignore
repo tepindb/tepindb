@@ -1,0 +1,24 @@
+# Rust
+target/
+Cargo.lock.orig
+
+# Engram local graph (personal)
+.engram/
+
+# IDE
+.idea/
+.vscode/
+
+# Local-only Claude Code config (machine-specific paths / permissions)
+.claude/settings.local.json
+.mcp.json
+
+# OS
+.DS_Store
+
+# Node (npx packaging)
+node_modules/
+# Platform binaries are dropped in by CI (or local testing) — never committed.
+npm/platform/*/bin/
+*.tgz
+*.tepin

@@ -1,0 +1,20 @@
+{
+  "name": "@tepindb/darwin-arm64",
+  "version": "0.0.0-dev",
+  "description": "tepin CLI binary for macOS arm64 (installed via the tepindb package)",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tepindb/tepindb.git"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "preferUnplugged": true
+}

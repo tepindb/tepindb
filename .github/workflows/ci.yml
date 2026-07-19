@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets draft-release.yml run the full suite as a gate before drafting.
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Tier-1 targets: macOS arm64, Linux x64, Windows x64
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # The onnx feature pulls in ort (onnxruntime) — building it on every
+      # tier-1 target is exactly where cross-platform pain surfaces early.
+      # The real-model test stays ignored (no 34MB download in CI).
+      - run: cargo clippy -p tepin-embed --features onnx --all-targets -- -D warnings
+      - run: cargo test -p tepin-embed --features onnx
+      # The slim (npx) build must keep compiling warning-free too.
+      - run: cargo clippy -p tepin-cli --no-default-features --all-targets -- -D warnings
+
+  lint:
+    # Non-Rust linters (Rust fmt/clippy run in the test matrix):
+    # shellcheck for shell scripts, actionlint for workflows (it also
+    # shellchecks inline run: blocks), Biome for the npm packaging JS.
+    name: lint (shell, workflows, js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: git ls-files '*.sh' | xargs -r shellcheck
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: biome (npm/ packaging)
+        run: npx --yes @biomejs/biome@2.5.4 ci npm/
+
+  fuzz-smoke:
+    name: fuzz smoke (preamble parser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz
+      - run: cargo +nightly fuzz run preamble -- -runs=5000 -max_total_time=60

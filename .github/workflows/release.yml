@@ -1,0 +1,187 @@
+name: Release
+
+# Step 2 of the release flow: fires when the draft created by draft-release.yml
+# is published (approved in the GitHub UI). Builds the tepin binary for every
+# tier-1 target and attaches it — with a sha256 per asset and an SBOM for the
+# release — to the GitHub release. Artifact versions derive from the tag
+# (v0.1.2 -> 0.1.2), not from the files checked into the repo.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)build artifacts for, e.g. v0.1.2'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  binaries:
+    name: Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # No x86_64-apple-darwin: ort ships no prebuilt ONNX Runtime for
+      # Intel macs anymore — Apple support is arm64-only.
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            npm: darwin-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            npm: win32-x64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Every crate inherits the workspace version, so stamping the root
+      # manifest fixes `tepin --version` and the created_with field written
+      # into every new .tepin preamble in one place.
+      - name: Sync workspace version from tag
+        shell: bash
+        run: |
+          V="${RELEASE_TAG#v}"
+          sed -i.bak "s/^version = \"[0-9.]*\"/version = \"$V\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+
+      - name: Build release binary
+        run: cargo build --release -p tepin-cli
+
+      - name: Package tarball + checksum
+        if: runner.os != 'Windows'
+        run: |
+          ASSET="tepin-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ASSET" -C target/release tepin
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          echo "ASSETS=$ASSET $ASSET.sha256" >> "$GITHUB_ENV"
+
+      - name: Package raw exe + checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "tepin-$env:RELEASE_TAG-${{ matrix.target }}.exe"
+          Copy-Item target/release/tepin.exe $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  $exe" | Out-File -Encoding ascii "$exe.sha256"
+          "ASSETS=$exe $exe.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      # Slim build: no ONNX, small binary — this is what ships to npm as
+      # @tepindb/<platform>. Built after the full binary, so target/release/
+      # tepin now refers to the slim one.
+      - name: Build slim binary (npm)
+        run: cargo build --release -p tepin-cli --no-default-features
+
+      - name: Package slim tarball + checksum
+        if: runner.os != 'Windows'
+        run: |
+          ASSET="tepin-slim-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          tar -czf "$ASSET" -C target/release tepin
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          echo "ASSETS=$ASSETS $ASSET $ASSET.sha256" >> "$GITHUB_ENV"
+
+      - name: Package slim exe + checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "tepin-slim-$env:RELEASE_TAG-${{ matrix.target }}.exe"
+          Copy-Item target/release/tepin.exe $exe
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  $exe" | Out-File -Encoding ascii "$exe.sha256"
+          "ASSETS=$env:ASSETS $exe $exe.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
+      # Hand the slim binary to the npm job below.
+      - name: Upload slim binary for npm packaging
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.npm }}
+          path: |
+            target/release/tepin
+            target/release/tepin.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Deliberately unquoted: ASSETS is a space-separated file list.
+        run: gh release upload "$RELEASE_TAG" $ASSETS --clobber
+
+  sbom:
+    name: SBOM — generate, attach
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: spdx-json
+          output-file: tepindb-${{ env.RELEASE_TAG }}.spdx.json
+          upload-artifact: false
+
+      - name: Attach SBOM to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$RELEASE_TAG" "tepindb-${RELEASE_TAG}.spdx.json" --clobber
+
+  npm:
+    name: npm — publish tepindb, tepin, @tepindb/*
+    needs: [binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm --provenance attestation via GitHub OIDC
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Download slim binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: npm-*
+          path: dist-bin
+
+      # Artifacts lose the executable bit; install(1) restores it.
+      - name: Assemble platform packages
+        run: |
+          install -Dm755 dist-bin/npm-darwin-arm64/tepin npm/platform/darwin-arm64/bin/tepin
+          install -Dm755 dist-bin/npm-linux-x64/tepin npm/platform/linux-x64/bin/tepin
+          install -Dm644 dist-bin/npm-win32-x64/tepin.exe npm/platform/win32-x64/bin/tepin.exe
+
+      - name: Stamp package versions from tag
+        run: node npm/stamp.mjs "${RELEASE_TAG#v}"
+
+      # Platform packages first so the main package never points at a
+      # version of them that is not yet live; the alias goes last.
+      # Uses a classic NPM_TOKEN + --provenance; npm now prefers OIDC
+      # trusted publishing (no token, provenance automatic) — switch once
+      # the packages exist and trusted publishers can be registered.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in npm/platform/darwin-arm64 npm/platform/linux-x64 npm/platform/win32-x64 npm/tepindb npm/tepin; do
+            npm publish "$pkg" --provenance --access public
+          done

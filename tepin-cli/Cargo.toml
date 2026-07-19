@@ -1,0 +1,27 @@
+[package]
+name = "tepin-cli"
+description = "The tepin CLI — inspect, query, and serve MCP for .tepin databases"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tepin"
+path = "src/main.rs"
+
+[features]
+# Full build: semantic search in the CLI and MCP server (pulls in ort).
+# The slim npx binary is built with --no-default-features.
+default = ["embed"]
+embed = ["tepin-embed/onnx"]
+
+[dependencies]
+tepin-core = { path = "../tepin-core", version = "0.1.0" }
+tepin-embed = { path = "../tepin-embed", version = "0.1.0" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

@@ -1,0 +1,21 @@
+[package]
+name = "tepin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tepin-core = { path = "../tepin-core" }
+
+[[bin]]
+name = "preamble"
+path = "fuzz_targets/preamble.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

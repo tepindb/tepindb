@@ -1,0 +1,25 @@
+# A real (if tiny) application built on the tepindb driver — the reference
+# for how an app wires it up, and a workspace member so `cargo test
+# --workspace` compiles driver + app and runs the end-to-end tests on every
+# CI run. Never published.
+
+[package]
+name = "notes-app"
+description = "TepinDB example application: a note-taking CLI with semantic search"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "notes"
+path = "src/main.rs"
+
+[dependencies]
+tepindb = { path = "../../tepindb" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

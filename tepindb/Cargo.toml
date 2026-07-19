@@ -1,0 +1,27 @@
+[package]
+name = "tepindb"
+description = "AI-first single-file database for CLI tools and agents — documents, filters, and built-in vector search in one .tepin file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+# On by default: `tepindb::open_auto()` can wire up bge-small (lazy,
+# SHA-256-pinned download on first embed). Nothing downloads unless the
+# application calls open_auto/attach — model loading is always explicit.
+# Disable for slim builds: `default-features = false`.
+default = ["embedding"]
+embedding = ["tepin-embed/onnx"]
+
+[dependencies]
+tepin-core = { path = "../tepin-core", version = "0.1.0" }
+tepin-embed = { path = "../tepin-embed", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
+
+[[example]]
+name = "vector_search"
+required-features = ["embedding"]
