@@ -39,6 +39,10 @@ tepin mcp    memory.tepin            # plug the db into an AI agent (MCP)
 Status: early. The format may change freely before 1.0 (`tepin migrate`
 will always cover you). Plan lives in [plan.md](plan.md).
 
+TepinDB is developed with [Engram](https://github.com/techtheist/engram)
+as its durable project memory — and Engram's own storage is moving onto
+TepinDB. The dogfooding runs both ways.
+
 ## License
 
 MIT or Apache-2.0, at your option.
