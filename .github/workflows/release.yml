@@ -151,6 +151,44 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$RELEASE_TAG" "tepindb-${RELEASE_TAG}.spdx.json" --clobber
 
+  crates:
+    name: crates.io — publish workspace crates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Stamp the workspace version AND the intra-workspace dependency
+      # requirements, so tepin-embed vX.Y.Z depends on tepin-core vX.Y.Z.
+      - name: Sync versions from tag
+        run: |
+          V="${RELEASE_TAG#v}"
+          sed -i "s/^version = \"[0-9.]*\"/version = \"$V\"/" Cargo.toml
+          sed -i -E "s/(path = \"[^\"]*\", version = \")[0-9.]+(\")/\1$V\2/" \
+            tepin-embed/Cargo.toml tepin-cli/Cargo.toml tepindb/Cargo.toml tepin/Cargo.toml
+
+      # Skip-if-published makes workflow_dispatch re-runs idempotent;
+      # --allow-dirty because of the version stamping above.
+      - name: Publish in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          V="${RELEASE_TAG#v}"
+          for c in tepin-core tepin-embed tepindb tepin-cli tepin; do
+            if curl -sf "https://crates.io/api/v1/crates/$c/$V" > /dev/null; then
+              echo "$c $V already on crates.io — skipping"
+              continue
+            fi
+            cargo publish -p "$c" --allow-dirty
+          done
+
   npm:
     name: npm — publish tepindb, tepin, @tepindb/*
     needs: [binaries]
