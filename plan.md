@@ -7,7 +7,7 @@ AI-first, single-file micro-database for CLI tools and agents. Rust core on redb
 ## Milestones
 
 1. **Core** — ✅ document store on redb, `.tepin` format (self-describing 4KB preamble), Mongo-subset filters, locking, validation suite.
-2. **Embed** — ✅ ONNX + bge-small, async init, pinned-hash lazy download, write→embed→search pipeline, brute-force search, **hybrid BM25+vector fusion**.
+2. **Embed** — ✅ ONNX + bge-small, async init, pinned-hash lazy download (from our own model release), write→embed→search pipeline, brute-force search, **hybrid BM25+vector fusion**, **built-in chunking** (one vector per chunk, best-chunk scoring, verbatim snippets).
 3. **Rust driver** — ✅ `tepindb` crate: `open` / `open_auto` / custom embedders; example app + examples.
 4. **Tooling** — ✅ `tepin mcp` server, CLI search, npx packaging (`npm/`: tepindb + tepin alias + @tepindb platform packages, published with provenance from release.yml). Remaining: claim npm/crates registrations, first release.
 5. **Dogfood** — replace sqlite in Engram with TepinDB — **unblocked now that hybrid landed**.
@@ -15,5 +15,4 @@ AI-first, single-file micro-database for CLI tools and agents. Rust core on redb
 
 ## Open questions
 
-- Built-in chunking design (multiple vectors per doc) vs v0's loud truncation.
 - Competitive positioning vs LanceDB / sqlite-vec (agent ergonomics is the bet).

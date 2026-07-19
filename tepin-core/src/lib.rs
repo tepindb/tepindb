@@ -17,6 +17,7 @@
 //! # Ok::<(), tepin_core::TepinError>(())
 //! ```
 
+pub mod chunk;
 mod db;
 pub mod embed;
 mod error;
@@ -25,6 +26,7 @@ mod fts;
 mod id;
 mod vector;
 
+pub use chunk::chunk_text;
 pub use db::{CollectionInfo, CollectionMeta, Db};
 pub use error::{Result, TepinError};
 pub use vector::SearchHit;

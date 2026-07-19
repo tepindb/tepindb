@@ -21,6 +21,9 @@ tepin mcp    memory.tepin            # plug the db into an AI agent (MCP)
 - **Single file, zero config** — everything about a database lives inside it.
 - **Vector search built in** — ONNX + bge-small, `db.embed()`-simple, lazy
   model download (pinned SHA-256, from GitHub releases only).
+- **Chunking built in** — long documents get one vector per chunk
+  automatically; search scores every chunk and returns the matching
+  excerpt as a `snippet`. No chunking code in your app, ever.
 - **Made for agents** — self-describing file, MCP tools, MongoDB-style
   filters, every error carries `{code, message, hint}`.
 - **Rust core on [redb](https://github.com/cberner/redb)** — ACID,

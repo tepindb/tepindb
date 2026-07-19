@@ -86,6 +86,16 @@ fn insert_doc(table: &mut redb::Table<&str, &[u8]>, mut doc: Value) -> Result<(S
     })?;
     let id = match obj.get("_id") {
         Some(Value::String(explicit)) => {
+            // Ids are storage-key material (vector rows are `{id}\0{chunk}`)
+            // — control characters would make the encoding ambiguous.
+            if explicit.is_empty() || explicit.len() > 256 || explicit.chars().any(char::is_control)
+            {
+                return Err(TepinError::new(
+                    "invalid_document",
+                    format!("invalid _id {explicit:?}"),
+                    "_id must be 1-256 bytes with no control characters; omit it to auto-generate one",
+                ));
+            }
             if table.get(explicit.as_str())?.is_some() {
                 return Err(TepinError::new(
                     "duplicate_id",

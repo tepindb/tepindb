@@ -15,6 +15,7 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::chunk::{chunk_text, MAX_CHUNKS};
 use crate::db::{
     data_table, validate_collection_name, CollectionMeta, Core, Db, COLLECTION_PREFIX, META,
 };
@@ -35,18 +36,46 @@ fn pending_key(collection: &str, id: &str) -> String {
     format!("{collection}\u{0}{id}")
 }
 
+/// One vector row per chunk: `{id}\0{chunk_idx}`. Doc ids can't contain
+/// control characters (validated on insert), so the separator is
+/// unambiguous. A key without a separator is a pre-chunking row read as
+/// chunk 0 — old files keep working without migration.
+fn chunk_key(id: &str, idx: usize) -> String {
+    format!("{id}\u{0}{idx}")
+}
+
+fn parse_chunk_key(key: &str) -> (&str, u32) {
+    match key.rsplit_once('\u{0}') {
+        Some((id, idx)) => match idx.parse() {
+            Ok(i) => (id, i),
+            Err(_) => (key, 0),
+        },
+        None => (key, 0),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct EmbedderInfo {
     model_id: String,
     dim: usize,
 }
 
-/// One search result. `truncated` surfaces loud truncation from write time.
+/// One search result. Long documents are chunked at write time (one vector
+/// per chunk); a hit is the document's best-matching chunk. `snippet` is
+/// that chunk's text verbatim — the relevant excerpt, not the whole blob.
+/// `truncated` surfaces loud truncation from write time (rare with
+/// chunking: an over-dense single chunk, or a doc past the chunk cap).
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub collection: String,
     pub id: String,
     pub score: f32,
+    /// Index of the best-matching chunk (0 for unchunked short docs).
+    pub chunk: u32,
+    /// Total chunks this document's embed text splits into.
+    pub chunks: u32,
+    /// The best-matching chunk's text.
+    pub snippet: String,
     pub truncated: bool,
     pub doc: Value,
 }
@@ -315,7 +344,8 @@ impl Db {
                 .collect(),
         };
 
-        let mut hits: Vec<(String, String, f32, bool)> = Vec::new();
+        // Score every chunk, keep each document's best chunk (max-sim).
+        let mut hits: Vec<(String, String, f32, bool, u32)> = Vec::new();
         for col in &targets {
             let table_name = vec_table(col);
             let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
@@ -324,12 +354,23 @@ impl Db {
                 Err(redb::TableError::TableDoesNotExist(_)) => continue,
                 Err(e) => return Err(e.into()),
             };
+            let mut best: HashMap<String, (f32, u32, bool)> = HashMap::new();
             for entry in table.iter()? {
-                let (id, bytes) = entry?;
+                let (key, bytes) = entry?;
+                let (id, chunk_idx) = parse_chunk_key(key.value());
                 if let Some((truncated, vector)) = decode_vector(bytes.value(), dim) {
                     let score = cosine(&query_embedding.vector, &vector);
-                    hits.push((col.clone(), id.value().to_string(), score, truncated));
+                    match best.get_mut(id) {
+                        Some(b) if b.0 >= score => {}
+                        Some(b) => *b = (score, chunk_idx, truncated),
+                        None => {
+                            best.insert(id.to_string(), (score, chunk_idx, truncated));
+                        }
+                    }
                 }
+            }
+            for (id, (score, chunk_idx, truncated)) in best {
+                hits.push((col.clone(), id, score, truncated, chunk_idx));
             }
         }
 
@@ -362,8 +403,14 @@ impl Db {
         hits.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(limit);
 
+        // Fetch winning docs; the deterministic chunker re-derives the
+        // best chunk's text as the snippet.
+        let embed_fields: HashMap<&str, &[String]> = all
+            .iter()
+            .map(|c| (c.name.as_str(), c.embed.as_slice()))
+            .collect();
         let mut results = Vec::with_capacity(hits.len());
-        for (col, id, score, truncated) in hits {
+        for (col, id, score, truncated, chunk_idx) in hits {
             let table_name = data_table(&col);
             let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
             let table = match txn.open_table(def) {
@@ -372,12 +419,25 @@ impl Db {
                 Err(e) => return Err(e.into()),
             };
             if let Some(bytes) = table.get(id.as_str())? {
+                let doc: Value = serde_json::from_slice(bytes.value())?;
+                let fields = embed_fields.get(col.as_str()).copied().unwrap_or(&[]);
+                let chunks = chunk_text(&build_text(&doc, fields));
+                // A mid-backfill doc can briefly disagree with its stored
+                // chunk index; fall back rather than fail the search.
+                let snippet = chunks
+                    .get(chunk_idx as usize)
+                    .or_else(|| chunks.first())
+                    .cloned()
+                    .unwrap_or_default();
                 results.push(SearchHit {
                     collection: col,
                     id,
                     score,
+                    chunk: chunk_idx,
+                    chunks: chunks.len() as u32,
+                    snippet,
                     truncated,
-                    doc: serde_json::from_slice(bytes.value())?,
+                    doc,
                 });
             }
         }
@@ -432,7 +492,8 @@ pub(crate) fn embed_fields_in_txn(
     Ok(fields)
 }
 
-/// Remove a doc's vector and queue rows (the delete path).
+/// Remove a doc's vector and queue rows (the delete path). Covers both
+/// chunked rows (`id\0{n}`) and the pre-chunking plain-key row.
 pub(crate) fn remove_vector_rows(
     txn: &redb::WriteTransaction,
     collection: &str,
@@ -441,14 +502,27 @@ pub(crate) fn remove_vector_rows(
     let table_name = vec_table(collection);
     let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
     match txn.open_table(def) {
-        Ok(mut t) => {
-            t.remove(id)?;
-        }
+        Ok(mut t) => remove_doc_vectors(&mut t, id)?,
         Err(redb::TableError::TableDoesNotExist(_)) => {}
         Err(e) => return Err(e.into()),
     }
     let mut pending = txn.open_table(PENDING)?;
     pending.remove(pending_key(collection, id).as_str())?;
+    Ok(())
+}
+
+/// Remove every vector row belonging to one document.
+fn remove_doc_vectors(table: &mut redb::Table<&str, &[u8]>, id: &str) -> Result<()> {
+    table.remove(id)?;
+    let start = format!("{id}\u{0}");
+    let end = format!("{id}\u{1}");
+    let keys: Vec<String> = table
+        .range(start.as_str()..end.as_str())?
+        .map(|e| e.map(|(k, _)| k.value().to_string()))
+        .collect::<std::result::Result<_, _>>()?;
+    for key in keys {
+        table.remove(key.as_str())?;
+    }
     Ok(())
 }
 
@@ -511,22 +585,35 @@ fn worker_loop(core: &Core, embedder: &dyn Embedder, shared: &Shared) {
                 break;
             }
             // Embed outside any transaction — inference must never hold
-            // the write lock.
-            let mut embeddings: Vec<Option<Embedding>> = Vec::with_capacity(batch.len());
+            // the write lock. Long docs are chunked; one vector per chunk.
+            let mut embeddings: Vec<Option<Vec<Embedding>>> = Vec::with_capacity(batch.len());
             let mut embed_failed = false;
-            for item in &batch {
+            'items: for item in &batch {
                 if item.doc_bytes.is_none() || item.text.is_empty() {
                     embeddings.push(None);
                     continue;
                 }
-                match embedder.embed(&item.text) {
-                    Ok(e) => embeddings.push(Some(e)),
-                    Err(e) => {
-                        record_error(shared, &e);
-                        embed_failed = true;
-                        break;
+                let mut chunks = chunk_text(&item.text);
+                let capped = chunks.len() > MAX_CHUNKS;
+                chunks.truncate(MAX_CHUNKS);
+                let mut vecs = Vec::with_capacity(chunks.len());
+                for chunk in &chunks {
+                    match embedder.embed(chunk) {
+                        Ok(e) => vecs.push(e),
+                        Err(e) => {
+                            record_error(shared, &e);
+                            embed_failed = true;
+                            break 'items;
+                        }
                     }
                 }
+                if capped {
+                    // Text past the chunk cap was not embedded — say so.
+                    if let Some(last) = vecs.last_mut() {
+                        last.truncated = true;
+                    }
+                }
+                embeddings.push(Some(vecs));
             }
             if embed_failed {
                 // Leave the queue as is; retry on the next nudge instead of
@@ -618,7 +705,7 @@ fn store_batch(
     core: &Core,
     embedder: &dyn Embedder,
     batch: &[PendingItem],
-    embeddings: &[Option<Embedding>],
+    embeddings: &[Option<Vec<Embedding>>],
 ) -> Result<u64> {
     let txn = core.db.begin_write()?;
     let mut stored = 0u64;
@@ -652,17 +739,15 @@ fn store_batch(
             let vec_name = vec_table(&item.collection);
             let vdef: TableDefinition<&str, &[u8]> = TableDefinition::new(&vec_name);
             let mut vectors = txn.open_table(vdef)?;
-            match embedding {
-                Some(e) => {
+            // Replace, never merge: drop every existing row for this doc
+            // (a re-embed may produce fewer chunks; deletes produce none).
+            remove_doc_vectors(&mut vectors, &item.id)?;
+            if let Some(chunk_vecs) = embedding {
+                for (idx, e) in chunk_vecs.iter().enumerate() {
                     vectors.insert(
-                        item.id.as_str(),
+                        chunk_key(&item.id, idx).as_str(),
                         encode_vector(e.truncated, &e.vector).as_slice(),
                     )?;
-                }
-                None => {
-                    // Doc deleted or nothing to embed: make sure no stale
-                    // vector survives.
-                    vectors.remove(item.id.as_str())?;
                 }
             }
             drop(vectors);
