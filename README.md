@@ -1,5 +1,10 @@
 # TepinDB
 
+[![CI](https://github.com/tepindb/tepindb/actions/workflows/ci.yml/badge.svg)](https://github.com/tepindb/tepindb/actions/workflows/ci.yml)
+[![crates.io: tepindb](https://img.shields.io/crates/v/tepindb?label=tepindb)](https://crates.io/crates/tepindb)
+[![crates.io: tepin-cli](https://img.shields.io/crates/v/tepin-cli?label=tepin-cli)](https://crates.io/crates/tepin-cli)
+[![docs.rs](https://img.shields.io/docsrs/tepindb)](https://docs.rs/tepindb)
+
 **AI-first, single-file micro-database for CLI tools and agents.**
 
 One `.tepin` file holds your documents, your indexes, your vectors — and its
