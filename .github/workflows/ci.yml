@@ -29,6 +29,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # esaxx-rs (via tokenizers) hardcodes the static CRT, but ort's
+      # prebuilt onnxruntime objects use the dynamic CRT -> LNK2038.
+      # cc appends user flags last, so /MD overrides the hardcoded /MT.
+      - name: Use dynamic CRT for C/C++ deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CFLAGS=/MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

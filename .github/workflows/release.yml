@@ -48,6 +48,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # esaxx-rs (via tokenizers) hardcodes the static CRT, but ort's
+      # prebuilt onnxruntime objects use the dynamic CRT -> LNK2038.
+      # cc appends user flags last, so /MD overrides the hardcoded /MT.
+      - name: Use dynamic CRT for C/C++ deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CFLAGS=/MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
+
       # Every crate inherits the workspace version, so stamping the root
       # manifest fixes `tepin --version` and the created_with field written
       # into every new .tepin preamble in one place.
@@ -117,8 +127,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # Deliberately unquoted: ASSETS is a space-separated file list.
-        run: gh release upload "$RELEASE_TAG" $ASSETS --clobber
+        run: |
+          # shellcheck disable=SC2086  # ASSETS is a deliberate space-separated list
+          gh release upload "$RELEASE_TAG" $ASSETS --clobber
 
   sbom:
     name: SBOM — generate, attach
