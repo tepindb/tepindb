@@ -197,16 +197,34 @@ jobs:
       contents: read
       id-token: write # npm --provenance attestation via GitHub OIDC
     steps:
+      # npm registration is still pending: a missing NPM_TOKEN must skip
+      # this job's work, not fail the release. (Secrets can't be read in a
+      # job-level `if`, hence the step-level gate.)
+      - name: Gate on NPM_TOKEN
+        id: gate
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "No NPM_TOKEN secret configured — skipping npm publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v7
+        if: steps.gate.outputs.skip != 'true'
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
       - uses: actions/setup-node@v7
+        if: steps.gate.outputs.skip != 'true'
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
       - name: Download slim binaries
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: npm-*
@@ -214,12 +232,14 @@ jobs:
 
       # Artifacts lose the executable bit; install(1) restores it.
       - name: Assemble platform packages
+        if: steps.gate.outputs.skip != 'true'
         run: |
           install -Dm755 dist-bin/npm-darwin-arm64/tepin npm/platform/darwin-arm64/bin/tepin
           install -Dm755 dist-bin/npm-linux-x64/tepin npm/platform/linux-x64/bin/tepin
           install -Dm644 dist-bin/npm-win32-x64/tepin.exe npm/platform/win32-x64/bin/tepin.exe
 
       - name: Stamp package versions from tag
+        if: steps.gate.outputs.skip != 'true'
         run: node npm/stamp.mjs "${RELEASE_TAG#v}"
 
       # Platform packages first so the main package never points at a
@@ -228,6 +248,7 @@ jobs:
       # trusted publishing (no token, provenance automatic) — switch once
       # the packages exist and trusted publishers can be registered.
       - name: Publish
+        if: steps.gate.outputs.skip != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |

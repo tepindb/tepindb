@@ -23,17 +23,17 @@ pub struct ModelSpec {
 
 /// bge-small-en-v1.5, int8-quantized ONNX.
 ///
-/// TEMPORARY: these URLs point at Hugging Face until the tepindb GitHub
-/// releases exist to mirror the files — the standing decision is that the
-/// runtime fetches only from our own releases. The SHA-256 pins already
-/// enforce byte-exact content regardless of the host.
+/// Served exclusively from this project's GitHub releases (a dedicated
+/// `model-*` release, so the URL is stable across software versions).
+/// Origin: Xenova/bge-small-en-v1.5 (Apache-2.0); the SHA-256 pins
+/// enforce byte-exact content on top of the trusted host.
 pub const BGE_SMALL: ModelSpec = ModelSpec {
     id: crate::DEFAULT_MODEL,
     dim: crate::DEFAULT_DIM,
     model_url:
-        "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_quantized.onnx",
+        "https://github.com/tepindb/tepindb/releases/download/model-bge-small-en-v1.5/model_quantized.onnx",
     model_sha256: "6c9c6101a956d62dfb5e7190c538226c0c5bb9cb27b651234b6df063ee7dbfe4",
-    tokenizer_url: "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/tokenizer.json",
+    tokenizer_url: "https://github.com/tepindb/tepindb/releases/download/model-bge-small-en-v1.5/tokenizer.json",
     tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
 };
 
