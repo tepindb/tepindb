@@ -228,7 +228,7 @@ fn crud_never_blocks_on_a_slow_embedder() {
             4
         }
         fn embed(&self, _: &str) -> tepin_core::Result<Embedding> {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(300));
             Ok(Embedding {
                 vector: vec![0.5; 4],
                 truncated: false,
@@ -247,11 +247,15 @@ fn crud_never_blocks_on_a_slow_embedder() {
             .unwrap();
         db.find("notes", &json!({})).unwrap();
     }
+    // Blocking on the embedder would cost >= 5 x 300ms = 1.5s; a 1s budget
+    // leaves room for slow CI disks (Windows fsyncs ate a 300ms budget).
     assert!(
-        t0.elapsed() < std::time::Duration::from_millis(300),
+        t0.elapsed() < std::time::Duration::from_millis(1000),
         "5 inserts + finds took {:?} — CRUD must not wait for embedding",
         t0.elapsed()
     );
+    // Timing-free proof: the queue can't be drained yet unless CRUD waited.
+    assert!(db.pending_embeddings().unwrap() > 0);
     db.flush_embeddings().unwrap();
     assert_eq!(db.pending_embeddings().unwrap(), 0);
 }
