@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 
 [features]
 # Pulls in onnxruntime (via ort) and the model plumbing. Off by default so
