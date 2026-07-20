@@ -26,6 +26,11 @@ tepin mcp    memory.tepin            # plug the db into an AI agent (MCP)
   excerpt as a `snippet`. No chunking code in your app, ever.
 - **Made for agents** — self-describing file, MCP tools, MongoDB-style
   filters, every error carries `{code, message, hint}`.
+- **Primitives tier** — or bring your own model: manual vector mode
+  (`set_vectors` / `search_by_vector` / raw `keyword_search` for custom
+  fusion), atomic multi-collection `batch` writes, secondary equality
+  indexes, `open_in_memory`. The zero-config tier is built on the same
+  primitives.
 - **Rust core on [redb](https://github.com/cberner/redb)** — ACID,
   immediate-fsync durability by default.
 
