@@ -26,7 +26,10 @@
 //! opening stays instant; only `embed`/`search` wait for readiness.
 
 pub use tepin_core::embed::{cosine, Embedder, Embedding, MockEmbedder};
-pub use tepin_core::{CollectionInfo, CollectionMeta, Db, Result, SearchHit, TepinError};
+pub use tepin_core::{
+    chunk_text, BatchOp, CollectionInfo, CollectionMeta, Db, KeywordHit, Result, SearchHit,
+    TepinError, VectorHit,
+};
 pub use tepin_embed::{EmbedderStatus, LazyEmbedder};
 
 #[cfg(feature = "embedding")]

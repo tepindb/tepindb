@@ -80,6 +80,26 @@ pub struct SearchHit {
     pub doc: Value,
 }
 
+/// One raw vector-search hit (the primitives tier): the document's
+/// best-matching chunk by cosine, no keyword fusion, no doc fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct VectorHit {
+    pub collection: String,
+    pub id: String,
+    pub chunk: u32,
+    pub score: f32,
+    pub truncated: bool,
+}
+
+/// One raw BM25 keyword hit (the primitives tier). Scores are comparable
+/// within one collection; across collections they are raw BM25 sums.
+#[derive(Debug, Clone, Serialize)]
+pub struct KeywordHit {
+    pub collection: String,
+    pub id: String,
+    pub score: f32,
+}
+
 #[derive(Debug, Clone)]
 struct StoredError {
     code: &'static str,
@@ -200,6 +220,18 @@ impl Db {
     /// Every existing document is re-queued (auto-backfill); watch progress
     /// via `pending_embeddings()`.
     pub fn set_embed_fields(&self, collection: &str, fields: &[&str]) -> Result<()> {
+        self.configure_embed(collection, fields, false)
+    }
+
+    /// Manual vector mode (the primitives tier): the same fields drive the
+    /// keyword index, but the application supplies vectors itself via
+    /// [`Db::set_vectors`] — nothing is ever queued for auto-embedding and
+    /// no model is needed.
+    pub fn set_manual_vectors(&self, collection: &str, fields: &[&str]) -> Result<()> {
+        self.configure_embed(collection, fields, true)
+    }
+
+    fn configure_embed(&self, collection: &str, fields: &[&str], manual: bool) -> Result<()> {
         validate_collection_name(collection)?;
         let txn = self.core.db.begin_write()?;
         {
@@ -210,13 +242,14 @@ impl Db {
                 None => CollectionMeta::default(),
             };
             cm.embed = fields.iter().map(|f| f.to_string()).collect();
+            cm.manual_vectors = manual && !fields.is_empty();
             let json = serde_json::to_string(&cm)?;
             meta.insert(key.as_str(), json.as_str())?;
         }
         {
-            // Backfill: queue every existing doc for embedding and rebuild
-            // the keyword index in place; or clear both when embedding is
-            // being turned off.
+            // Backfill: queue every existing doc for embedding (auto mode)
+            // and rebuild the keyword index in place; manual mode and
+            // turning embedding off both clear the queue.
             let table_name = data_table(collection);
             let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
             let docs: Vec<(String, Vec<u8>)> = match txn.open_table(def) {
@@ -231,7 +264,7 @@ impl Db {
                 let mut pending = txn.open_table(PENDING)?;
                 for (id, _) in &docs {
                     let key = pending_key(collection, id);
-                    if fields.is_empty() {
+                    if fields.is_empty() || manual {
                         pending.remove(key.as_str())?;
                     } else {
                         pending.insert(key.as_str(), [].as_slice())?;
@@ -319,57 +352,14 @@ impl Db {
 
         let txn = self.core.db.begin_read()?;
         let all = self.collections()?;
-        let targets: Vec<String> = match collection {
-            Some(name) => {
-                let info = all.iter().find(|c| c.name == name).ok_or_else(|| {
-                    TepinError::new(
-                        "collection_not_found",
-                        format!("no collection named {name:?}"),
-                        "run `tepin inspect` to list collections",
-                    )
-                })?;
-                if info.embed.is_empty() {
-                    return Err(TepinError::new(
-                        "collection_not_embedded",
-                        format!("collection {name:?} has no embed fields configured"),
-                        "declare them first, e.g. `tepin embed-fields <file> <collection> <field>...`",
-                    ));
-                }
-                vec![name.to_string()]
-            }
-            None => all
-                .iter()
-                .filter(|c| !c.embed.is_empty())
-                .map(|c| c.name.clone())
-                .collect(),
-        };
+        let targets = embedded_targets(&all, collection)?;
 
         // Score every chunk, keep each document's best chunk (max-sim).
         let mut hits: Vec<(String, String, f32, bool, u32)> = Vec::new();
         for col in &targets {
-            let table_name = vec_table(col);
-            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
-            let table = match txn.open_table(def) {
-                Ok(t) => t,
-                Err(redb::TableError::TableDoesNotExist(_)) => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let mut best: HashMap<String, (f32, u32, bool)> = HashMap::new();
-            for entry in table.iter()? {
-                let (key, bytes) = entry?;
-                let (id, chunk_idx) = parse_chunk_key(key.value());
-                if let Some((truncated, vector)) = decode_vector(bytes.value(), dim) {
-                    let score = cosine(&query_embedding.vector, &vector);
-                    match best.get_mut(id) {
-                        Some(b) if b.0 >= score => {}
-                        Some(b) => *b = (score, chunk_idx, truncated),
-                        None => {
-                            best.insert(id.to_string(), (score, chunk_idx, truncated));
-                        }
-                    }
-                }
-            }
-            for (id, (score, chunk_idx, truncated)) in best {
+            for (id, score, chunk_idx, truncated) in
+                best_chunk_hits(&txn, col, &query_embedding.vector, dim)?
+            {
                 hits.push((col.clone(), id, score, truncated, chunk_idx));
             }
         }
@@ -444,6 +434,220 @@ impl Db {
         Ok(results)
     }
 
+    /// Supply a document's vectors yourself — the primitives tier. The
+    /// collection must be in manual mode ([`Db::set_manual_vectors`]); one
+    /// vector stores as chunk 0, several as chunks 0..n (your chunking,
+    /// your composition). The first write records `model_id` + dimension;
+    /// later writes must match — vectors from different models never mix.
+    pub fn set_vectors(
+        &self,
+        collection: &str,
+        id: &str,
+        model_id: &str,
+        vectors: &[Vec<f32>],
+    ) -> Result<()> {
+        let dim = match vectors.first() {
+            Some(v) if !v.is_empty() => v.len(),
+            _ => {
+                return Err(TepinError::new(
+                    "invalid_vector",
+                    "set_vectors needs at least one non-empty vector",
+                    "pass one vector per chunk, all with the same dimension",
+                ))
+            }
+        };
+        if vectors.iter().any(|v| v.len() != dim) {
+            return Err(TepinError::new(
+                "invalid_vector",
+                "vectors in one call must share a dimension",
+                "pass one vector per chunk, all with the same dimension",
+            ));
+        }
+
+        let txn = self.core.db.begin_write()?;
+        {
+            let cm = crate::db::collection_meta_in_txn(&txn, collection)?;
+            if !cm.manual_vectors {
+                return Err(TepinError::new(
+                    "manual_vectors_disabled",
+                    format!("collection {collection:?} is not in manual vector mode"),
+                    "call set_manual_vectors(collection, fields) first; auto-embedded collections own their vectors",
+                ));
+            }
+            let table_name = data_table(collection);
+            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
+            let exists = match txn.open_table(def) {
+                Ok(t) => t.get(id)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            if !exists {
+                return Err(TepinError::new(
+                    "doc_not_found",
+                    format!("no document {id:?} in collection {collection:?}"),
+                    "insert the document before attaching vectors to it",
+                ));
+            }
+
+            // Model guard, same rule as attach_embedder.
+            let mut meta = txn.open_table(META)?;
+            let stored: Option<EmbedderInfo> = meta
+                .get(EMBEDDER_KEY)?
+                .and_then(|v| serde_json::from_str(v.value()).ok());
+            match stored {
+                Some(info) => {
+                    if info.model_id != model_id || info.dim != dim {
+                        return Err(TepinError::new(
+                            "embedder_mismatch",
+                            format!(
+                                "this file's vectors are {} (dim {}), but set_vectors got {} (dim {})",
+                                info.model_id, info.dim, model_id, dim
+                            ),
+                            "keep one model per file, or re-vector the whole database with the new one",
+                        ));
+                    }
+                }
+                None => {
+                    let info = serde_json::to_string(&EmbedderInfo {
+                        model_id: model_id.to_string(),
+                        dim,
+                    })?;
+                    meta.insert(EMBEDDER_KEY, info.as_str())?;
+                }
+            }
+            drop(meta);
+
+            let vec_name = vec_table(collection);
+            let vdef: TableDefinition<&str, &[u8]> = TableDefinition::new(&vec_name);
+            let mut table = txn.open_table(vdef)?;
+            remove_doc_vectors(&mut table, id)?;
+            for (idx, v) in vectors.iter().enumerate() {
+                table.insert(
+                    chunk_key(id, idx).as_str(),
+                    encode_vector(false, v).as_slice(),
+                )?;
+            }
+            drop(table);
+            let mut pending = txn.open_table(PENDING)?;
+            pending.remove(pending_key(collection, id).as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read a document's stored vectors back, ordered by chunk index.
+    /// Empty when the document has no vectors (yet).
+    pub fn get_vectors(&self, collection: &str, id: &str) -> Result<Vec<Vec<f32>>> {
+        let Some(info) = self.stored_embedder_info()? else {
+            return Ok(Vec::new());
+        };
+        let txn = self.core.db.begin_read()?;
+        let vec_name = vec_table(collection);
+        let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&vec_name);
+        let table = match txn.open_table(def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut chunks: Vec<(u32, Vec<f32>)> = Vec::new();
+        if let Some(bytes) = table.get(id)? {
+            if let Some((_, v)) = decode_vector(bytes.value(), info.dim) {
+                chunks.push((0, v));
+            }
+        }
+        let start = format!("{id}\u{0}");
+        let end = format!("{id}\u{1}");
+        for entry in table.range(start.as_str()..end.as_str())? {
+            let (key, bytes) = entry?;
+            let (_, idx) = parse_chunk_key(key.value());
+            if let Some((_, v)) = decode_vector(bytes.value(), info.dim) {
+                chunks.push((idx, v));
+            }
+        }
+        chunks.sort_by_key(|(idx, _)| *idx);
+        Ok(chunks.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Raw KNN by a caller-supplied query vector — no embedder, no keyword
+    /// fusion, no doc fetch; per-document best chunk, best first. Does not
+    /// drain the auto-embed queue (manual collections have none).
+    pub fn search_by_vector(
+        &self,
+        collection: Option<&str>,
+        query: &[f32],
+        limit: usize,
+    ) -> Result<Vec<VectorHit>> {
+        let Some(info) = self.stored_embedder_info()? else {
+            return Ok(Vec::new());
+        };
+        if query.len() != info.dim {
+            return Err(TepinError::new(
+                "embedder_mismatch",
+                format!(
+                    "query vector has dim {}, this file's vectors have dim {}",
+                    query.len(),
+                    info.dim
+                ),
+                "produce the query vector with the same model that produced the stored vectors",
+            ));
+        }
+        let txn = self.core.db.begin_read()?;
+        let all = self.collections()?;
+        let targets = embedded_targets(&all, collection)?;
+        let mut hits = Vec::new();
+        for col in &targets {
+            for (id, score, chunk, truncated) in best_chunk_hits(&txn, col, query, info.dim)? {
+                hits.push(VectorHit {
+                    collection: col.clone(),
+                    id,
+                    chunk,
+                    score,
+                    truncated,
+                });
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Raw BM25 keyword scores for a text query — the keyword half of
+    /// hybrid search, exposed for custom fusion. Best first.
+    pub fn keyword_search(
+        &self,
+        collection: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<KeywordHit>> {
+        let txn = self.core.db.begin_read()?;
+        let all = self.collections()?;
+        let targets = embedded_targets(&all, collection)?;
+        let terms = crate::fts::tokenize(query);
+        let mut hits = Vec::new();
+        if !terms.is_empty() {
+            for col in &targets {
+                for (id, score) in crate::fts::bm25_scores(&txn, col, &terms)? {
+                    hits.push(KeywordHit {
+                        collection: col.clone(),
+                        id,
+                        score,
+                    });
+                }
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
     pub(crate) fn nudge_embed(&self) {
         if let Some(rt) = &self.embed {
             rt.nudge();
@@ -477,19 +681,72 @@ pub(crate) fn queue_pending<S: AsRef<str>>(
     Ok(())
 }
 
-/// Read the embed fields of a collection inside a write transaction.
-pub(crate) fn embed_fields_in_txn(
-    txn: &redb::WriteTransaction,
-    collection: &str,
+/// Resolve which collections a search runs over: one named embedded
+/// collection, or every embedded collection.
+fn embedded_targets(
+    all: &[crate::db::CollectionInfo],
+    collection: Option<&str>,
 ) -> Result<Vec<String>> {
-    let meta = txn.open_table(META)?;
-    let key = format!("{COLLECTION_PREFIX}{collection}");
-    let fields = meta
-        .get(key.as_str())?
-        .and_then(|v| serde_json::from_str::<CollectionMeta>(v.value()).ok())
-        .map(|cm| cm.embed)
-        .unwrap_or_default();
-    Ok(fields)
+    match collection {
+        Some(name) => {
+            let info = all.iter().find(|c| c.name == name).ok_or_else(|| {
+                TepinError::new(
+                    "collection_not_found",
+                    format!("no collection named {name:?}"),
+                    "run `tepin inspect` to list collections",
+                )
+            })?;
+            if info.embed.is_empty() {
+                return Err(TepinError::new(
+                    "collection_not_embedded",
+                    format!("collection {name:?} has no embed fields configured"),
+                    "declare them first, e.g. `tepin embed-fields <file> <collection> <field>...`",
+                ));
+            }
+            Ok(vec![name.to_string()])
+        }
+        None => Ok(all
+            .iter()
+            .filter(|c| !c.embed.is_empty())
+            .map(|c| c.name.clone())
+            .collect()),
+    }
+}
+
+/// Scan one collection's vector rows and keep each document's best chunk
+/// (max-sim): (id, score, chunk, truncated).
+fn best_chunk_hits(
+    txn: &redb::ReadTransaction,
+    col: &str,
+    query: &[f32],
+    dim: usize,
+) -> Result<Vec<(String, f32, u32, bool)>> {
+    let table_name = vec_table(col);
+    let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
+    let table = match txn.open_table(def) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut best: HashMap<String, (f32, u32, bool)> = HashMap::new();
+    for entry in table.iter()? {
+        let (key, bytes) = entry?;
+        let (id, chunk_idx) = parse_chunk_key(key.value());
+        if let Some((truncated, vector)) = decode_vector(bytes.value(), dim) {
+            let score = cosine(query, &vector);
+            match best.get_mut(id) {
+                Some(b) if b.0 >= score => {}
+                Some(b) => *b = (score, chunk_idx, truncated),
+                None => {
+                    best.insert(id.to_string(), (score, chunk_idx, truncated));
+                }
+            }
+        }
+    }
+    Ok(best
+        .into_iter()
+        .map(|(id, (score, chunk, truncated))| (id, score, chunk, truncated))
+        .collect())
 }
 
 /// Remove a doc's vector and queue rows (the delete path). Covers both

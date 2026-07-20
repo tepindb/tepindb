@@ -31,3 +31,9 @@ never repurposed.
 | `checksum_mismatch` | A downloaded or cached model file failed its pinned SHA-256 check. |
 | `model_load_failed` | The model files exist but onnxruntime/tokenizer could not load them. |
 | `embedding_failed` | Model inference failed for a specific input. |
+| `embedder_already_attached` | A database handle takes exactly one embedder; this one already has it. |
+| `embedder_not_attached` | `search` needs an embedder (or use `search_by_vector` / `keyword_search`, which don't). |
+| `embedder_mismatch` | The vectors in this file came from a different model or dimension than the one supplied. |
+| `collection_not_embedded` | The collection has no embed fields configured, so it cannot be searched. |
+| `invalid_vector` | `set_vectors` got no vectors, an empty vector, or mixed dimensions in one call. |
+| `manual_vectors_disabled` | `set_vectors` works only on collections in manual vector mode (`set_manual_vectors`). |

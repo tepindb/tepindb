@@ -24,9 +24,10 @@ mod error;
 pub mod format;
 mod fts;
 mod id;
+mod index;
 mod vector;
 
 pub use chunk::chunk_text;
-pub use db::{CollectionInfo, CollectionMeta, Db};
+pub use db::{BatchOp, CollectionInfo, CollectionMeta, Db};
 pub use error::{Result, TepinError};
-pub use vector::SearchHit;
+pub use vector::{KeywordHit, SearchHit, VectorHit};

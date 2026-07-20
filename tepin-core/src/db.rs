@@ -26,8 +26,16 @@ pub struct CollectionMeta {
     /// `tepin inspect` so an LLM knows the intent, not just the shape.
     pub purpose: Option<String>,
     /// Fields to embed automatically on write (vector search). Empty = none.
+    /// The same fields feed the keyword index in both modes.
     #[serde(default)]
     pub embed: Vec<String>,
+    /// Manual vector mode: the application supplies vectors via
+    /// `set_vectors` and nothing is queued for auto-embedding.
+    #[serde(default)]
+    pub manual_vectors: bool,
+    /// Fields with a secondary (equality) index.
+    #[serde(default)]
+    pub indexes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,7 +43,43 @@ pub struct CollectionInfo {
     pub name: String,
     pub purpose: Option<String>,
     pub embed: Vec<String>,
+    /// True when the application supplies vectors itself (`set_vectors`).
+    pub manual_vectors: bool,
+    /// Fields with a secondary (equality) index.
+    pub indexes: Vec<String>,
     pub count: u64,
+}
+
+/// One write in an atomic [`Db::batch`] — mixed collections welcome.
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    Insert {
+        collection: String,
+        doc: Value,
+    },
+    Update {
+        collection: String,
+        id: String,
+        doc: Value,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
+}
+
+/// Read a collection's meta inside a write transaction (default if absent).
+pub(crate) fn collection_meta_in_txn(
+    txn: &redb::WriteTransaction,
+    collection: &str,
+) -> Result<CollectionMeta> {
+    let meta = txn.open_table(META)?;
+    let json = meta
+        .get(format!("{COLLECTION_PREFIX}{collection}").as_str())?
+        .map(|v| v.value().to_string());
+    Ok(json
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default())
 }
 
 pub struct Db {
@@ -168,6 +212,17 @@ impl Db {
         })
     }
 
+    /// Open a fresh in-memory database: full engine, zero disk. Made for
+    /// test suites and ephemeral scratch stores; everything vanishes on
+    /// drop. No file, no preamble, no lock.
+    pub fn open_in_memory() -> Result<Self> {
+        let db = redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?;
+        Ok(Self {
+            core: std::sync::Arc::new(Core { db }),
+            embed: None,
+        })
+    }
+
     /// Open a .tepin file that must already exist — the read-path variant:
     /// a typo'd path is an error, never a silently created empty database.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
@@ -191,11 +246,22 @@ impl Db {
     }
 
     /// Insert a batch atomically: either every document lands or none does.
-    /// This is the whole transaction story users see — there is no exposed
-    /// transaction API in v1.
+    /// For multi-collection atomicity, see [`Db::batch`].
     pub fn insert_many(&self, collection: &str, docs: Vec<Value>) -> Result<Vec<String>> {
-        validate_collection_name(collection)?;
         let txn = self.core.db.begin_write()?;
+        let ids = self.insert_in_txn(&txn, collection, docs)?;
+        txn.commit()?;
+        self.nudge_embed();
+        Ok(ids)
+    }
+
+    fn insert_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        collection: &str,
+        docs: Vec<Value>,
+    ) -> Result<Vec<String>> {
+        validate_collection_name(collection)?;
         let mut ids = Vec::with_capacity(docs.len());
         let mut stored_docs = Vec::with_capacity(docs.len());
         {
@@ -207,29 +273,33 @@ impl Db {
                 ids.push(id);
                 stored_docs.push(stored);
             }
-
-            let meta_key = format!("{COLLECTION_PREFIX}{collection}");
-            let mut meta = txn.open_table(META)?;
-            let existing = meta.get(meta_key.as_str())?.map(|v| v.value().to_string());
-            let cm: CollectionMeta = match existing {
-                Some(json) => serde_json::from_str(&json).unwrap_or_default(),
-                None => {
-                    let default = CollectionMeta::default();
-                    meta.insert(meta_key.as_str(), serde_json::to_string(&default)?.as_str())?;
-                    default
-                }
-            };
-            drop(meta);
-            if !cm.embed.is_empty() {
-                crate::vector::queue_pending(&txn, collection, &ids)?;
-                for (id, doc) in ids.iter().zip(&stored_docs) {
-                    let text = crate::vector::build_text(doc, &cm.embed);
-                    crate::fts::index_add(&txn, collection, id, &text)?;
-                }
+        }
+        let meta_key = format!("{COLLECTION_PREFIX}{collection}");
+        let mut meta = txn.open_table(META)?;
+        let existing = meta.get(meta_key.as_str())?.map(|v| v.value().to_string());
+        let cm: CollectionMeta = match existing {
+            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+            None => {
+                let default = CollectionMeta::default();
+                meta.insert(meta_key.as_str(), serde_json::to_string(&default)?.as_str())?;
+                default
+            }
+        };
+        drop(meta);
+        if !cm.embed.is_empty() {
+            if !cm.manual_vectors {
+                crate::vector::queue_pending(txn, collection, &ids)?;
+            }
+            for (id, doc) in ids.iter().zip(&stored_docs) {
+                let text = crate::vector::build_text(doc, &cm.embed);
+                crate::fts::index_add(txn, collection, id, &text)?;
             }
         }
-        txn.commit()?;
-        self.nudge_embed();
+        for field in &cm.indexes {
+            for (id, doc) in ids.iter().zip(&stored_docs) {
+                crate::index::index_add(txn, collection, field, doc, id)?;
+            }
+        }
         Ok(ids)
     }
 
@@ -251,6 +321,10 @@ impl Db {
     }
 
     /// Find documents matching a MongoDB-style filter. `{}` matches all.
+    /// When a filter field has an equality condition and a secondary index
+    /// (see [`Db::create_index`]), candidates come from the index instead
+    /// of a full scan; every candidate is still verified against the full
+    /// filter, so results are identical either way.
     pub fn find(&self, collection: &str, filter: &Value) -> Result<Vec<Value>> {
         let filter_obj = filter.as_object().ok_or_else(|| {
             TepinError::new(
@@ -269,19 +343,126 @@ impl Db {
             }
             Err(e) => return Err(e.into()),
         };
+
+        // Planner: first indexed field carrying a direct equality wins.
+        let indexes = self.collection_indexes(collection)?;
+        let indexed_eq = filter_obj.iter().find_map(|(field, cond)| {
+            if !indexes.iter().any(|i| i == field) {
+                return None;
+            }
+            match cond {
+                Value::Object(ops) if ops.keys().any(|k| k.starts_with('$')) => {
+                    ops.get("$eq").map(|v| (field.as_str(), v))
+                }
+                direct => Some((field.as_str(), direct)),
+            }
+        });
+
         let mut out = Vec::new();
-        for entry in table.iter()? {
-            let (_, bytes) = entry?;
-            let doc: Value = serde_json::from_slice(bytes.value())?;
-            if matches_filter(&doc, filter_obj)? {
-                out.push(doc);
+        if let Some((field, value)) = indexed_eq {
+            let mut ids = crate::index::candidates(&txn, collection, field, value)?;
+            ids.sort(); // same id order a full scan would produce
+            for id in ids {
+                if let Some(bytes) = table.get(id.as_str())? {
+                    let doc: Value = serde_json::from_slice(bytes.value())?;
+                    if matches_filter(&doc, filter_obj)? {
+                        out.push(doc);
+                    }
+                }
+            }
+        } else {
+            for entry in table.iter()? {
+                let (_, bytes) = entry?;
+                let doc: Value = serde_json::from_slice(bytes.value())?;
+                if matches_filter(&doc, filter_obj)? {
+                    out.push(doc);
+                }
             }
         }
         Ok(out)
     }
 
+    fn collection_indexes(&self, collection: &str) -> Result<Vec<String>> {
+        Ok(self
+            .collections()?
+            .into_iter()
+            .find(|c| c.name == collection)
+            .map(|c| c.indexes)
+            .unwrap_or_default())
+    }
+
+    /// Create an equality index on a field (idempotent) and backfill it
+    /// from every existing document. `find` uses it automatically.
+    pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
+        validate_collection_name(collection)?;
+        let txn = self.core.db.begin_write()?;
+        {
+            let mut cm = collection_meta_in_txn(&txn, collection)?;
+            if !cm.indexes.iter().any(|i| i == field) {
+                cm.indexes.push(field.to_string());
+            }
+            let mut meta = txn.open_table(META)?;
+            let key = format!("{COLLECTION_PREFIX}{collection}");
+            meta.insert(key.as_str(), serde_json::to_string(&cm)?.as_str())?;
+        }
+        {
+            let table_name = data_table(collection);
+            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
+            let docs: Vec<(String, Value)> = match txn.open_table(def) {
+                Ok(t) => t
+                    .iter()?
+                    .filter_map(|e| {
+                        e.map(|(k, v)| {
+                            serde_json::from_slice(v.value())
+                                .ok()
+                                .map(|doc| (k.value().to_string(), doc))
+                        })
+                        .transpose()
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+            for (id, doc) in &docs {
+                crate::index::index_add(&txn, collection, field, doc, id)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Drop a field's equality index (idempotent). Data is untouched;
+    /// `find` falls back to scanning.
+    pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
+        let txn = self.core.db.begin_write()?;
+        {
+            let mut cm = collection_meta_in_txn(&txn, collection)?;
+            cm.indexes.retain(|i| i != field);
+            let mut meta = txn.open_table(META)?;
+            let key = format!("{COLLECTION_PREFIX}{collection}");
+            meta.insert(key.as_str(), serde_json::to_string(&cm)?.as_str())?;
+        }
+        crate::index::drop_index_table(&txn, collection, field)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Replace a document by id. The stored `_id` always wins.
-    pub fn update(&self, collection: &str, id: &str, mut doc: Value) -> Result<()> {
+    pub fn update(&self, collection: &str, id: &str, doc: Value) -> Result<()> {
+        let txn = self.core.db.begin_write()?;
+        self.update_in_txn(&txn, collection, id, doc)?;
+        txn.commit()?;
+        self.nudge_embed();
+        Ok(())
+    }
+
+    fn update_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        collection: &str,
+        id: &str,
+        mut doc: Value,
+    ) -> Result<()> {
         let obj = doc.as_object_mut().ok_or_else(|| {
             TepinError::new(
                 "invalid_document",
@@ -292,7 +473,6 @@ impl Db {
         obj.insert("_id".into(), Value::String(id.to_string()));
         let bytes = serde_json::to_vec(&doc)?;
 
-        let txn = self.core.db.begin_write()?;
         let old_bytes;
         {
             let table_name = data_table(collection);
@@ -310,25 +490,43 @@ impl Db {
             };
             table.insert(id, bytes.as_slice())?;
         }
+        let old_doc = serde_json::from_slice::<Value>(&old_bytes).ok();
         // The old vector and keyword entries are now stale — re-queue the
         // embedding and swap the index entries in the same transaction.
-        let fields = crate::vector::embed_fields_in_txn(&txn, collection)?;
-        if !fields.is_empty() {
-            crate::vector::queue_pending(&txn, collection, &[id])?;
-            if let Ok(old) = serde_json::from_slice::<Value>(&old_bytes) {
-                let old_text = crate::vector::build_text(&old, &fields);
-                crate::fts::index_remove(&txn, collection, id, &old_text)?;
+        let cm = collection_meta_in_txn(txn, collection)?;
+        if !cm.embed.is_empty() {
+            if !cm.manual_vectors {
+                crate::vector::queue_pending(txn, collection, &[id])?;
             }
-            let new_text = crate::vector::build_text(&doc, &fields);
-            crate::fts::index_add(&txn, collection, id, &new_text)?;
+            if let Some(old) = &old_doc {
+                let old_text = crate::vector::build_text(old, &cm.embed);
+                crate::fts::index_remove(txn, collection, id, &old_text)?;
+            }
+            let new_text = crate::vector::build_text(&doc, &cm.embed);
+            crate::fts::index_add(txn, collection, id, &new_text)?;
         }
-        txn.commit()?;
-        self.nudge_embed();
+        for field in &cm.indexes {
+            if let Some(old) = &old_doc {
+                crate::index::index_remove(txn, collection, field, old, id)?;
+            }
+            crate::index::index_add(txn, collection, field, &doc, id)?;
+        }
         Ok(())
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<()> {
         let txn = self.core.db.begin_write()?;
+        self.delete_in_txn(&txn, collection, id)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn delete_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        collection: &str,
+        id: &str,
+    ) -> Result<()> {
         let old_bytes;
         {
             let table_name = data_table(collection);
@@ -345,16 +543,45 @@ impl Db {
                 None => return Err(self.unknown_doc(collection, id)),
             };
         }
-        crate::vector::remove_vector_rows(&txn, collection, id)?;
-        let fields = crate::vector::embed_fields_in_txn(&txn, collection)?;
-        if !fields.is_empty() {
-            if let Ok(old) = serde_json::from_slice::<Value>(&old_bytes) {
-                let old_text = crate::vector::build_text(&old, &fields);
-                crate::fts::index_remove(&txn, collection, id, &old_text)?;
+        crate::vector::remove_vector_rows(txn, collection, id)?;
+        let old_doc = serde_json::from_slice::<Value>(&old_bytes).ok();
+        let cm = collection_meta_in_txn(txn, collection)?;
+        if !cm.embed.is_empty() {
+            if let Some(old) = &old_doc {
+                let old_text = crate::vector::build_text(old, &cm.embed);
+                crate::fts::index_remove(txn, collection, id, &old_text)?;
+            }
+        }
+        for field in &cm.indexes {
+            if let Some(old) = &old_doc {
+                crate::index::index_remove(txn, collection, field, old, id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a mixed sequence of writes across any collections in ONE
+    /// atomic transaction: either every operation lands or none does.
+    /// Returns the ids of inserted documents, in operation order.
+    pub fn batch(&self, ops: Vec<BatchOp>) -> Result<Vec<String>> {
+        let txn = self.core.db.begin_write()?;
+        let mut inserted = Vec::new();
+        for op in ops {
+            match op {
+                BatchOp::Insert { collection, doc } => {
+                    inserted.extend(self.insert_in_txn(&txn, &collection, vec![doc])?);
+                }
+                BatchOp::Update {
+                    collection,
+                    id,
+                    doc,
+                } => self.update_in_txn(&txn, &collection, &id, doc)?,
+                BatchOp::Delete { collection, id } => self.delete_in_txn(&txn, &collection, &id)?,
             }
         }
         txn.commit()?;
-        Ok(())
+        self.nudge_embed();
+        Ok(inserted)
     }
 
     /// Set the free-text purpose of a collection (creates its meta if needed).
@@ -387,6 +614,8 @@ impl Db {
                 name: name.to_string(),
                 purpose: cm.purpose,
                 embed: cm.embed,
+                manual_vectors: cm.manual_vectors,
+                indexes: cm.indexes,
                 count,
             });
         }
