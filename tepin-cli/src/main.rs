@@ -113,6 +113,15 @@ enum Command {
         collection: String,
         fields: Vec<String>,
     },
+    /// Rewrite a .tepin file from any published format into a fresh
+    /// current-format file — the original is never modified
+    Migrate {
+        #[command(flatten)]
+        file: FileArg,
+        /// Output path (default: the original with a .migrated.tepin suffix)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Serve MCP tools over stdio — plug this database into an AI agent
     Mcp {
         #[command(flatten)]
@@ -262,6 +271,19 @@ fn run(cli: Cli) -> Result<(), TepinError> {
                 "this build has no embedding support (slim binary)",
                 "use a full build (`cargo install tepin-cli`) for semantic search; `tepin query` works everywhere",
             ))
+        }
+        Command::Migrate { file, out } => {
+            let out = out.unwrap_or_else(|| file.file.with_extension("migrated.tepin"));
+            let report = tepin_core::migrate_file(&file.file, &out)?;
+            emit(&json!({
+                "migrated": file.file.display().to_string(),
+                "out": out.display().to_string(),
+                "from_format": report.from_format,
+                "to_format": report.to_format,
+                "collections": report.collections,
+                "documents": report.documents,
+                "vector_rows": report.vector_rows,
+            }));
         }
         Command::Mcp { file } => {
             mcp::serve(&file.file)?;

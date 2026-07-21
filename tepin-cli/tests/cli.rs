@@ -213,3 +213,34 @@ fn upsert_inserts_then_replaces() {
     assert_eq!(body["count"], 1);
     assert_eq!(body["docs"][0]["status"], "closed");
 }
+
+#[test]
+fn migrate_produces_a_working_copy_and_leaves_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("old.tepin");
+    tepin()
+        .args(["insert"])
+        .arg(&db)
+        .args(["notes", r#"{"_id": "n1", "title": "carried over"}"#])
+        .assert()
+        .success();
+    let original = std::fs::read(&db).unwrap();
+
+    let out = tepin().args(["migrate"]).arg(&db).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = json_stdout(&out);
+    assert_eq!(report["documents"], 1);
+    assert_eq!(std::fs::read(&db).unwrap(), original, "original untouched");
+
+    let migrated = report["out"].as_str().unwrap().to_string();
+    let out = tepin()
+        .args(["get", &migrated, "notes", "n1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(json_stdout(&out)["title"], "carried over");
+}

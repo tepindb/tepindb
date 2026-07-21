@@ -28,6 +28,8 @@ never repurposed.
 | `collection_not_found` | The named collection does not exist in this database (a configured-but-empty collection reads as empty instead). |
 | `doc_not_found` | No document with that id exists in the collection. |
 | `not_implemented` | The operation exists in the surface but is not wired up in this build. |
+| `destination_exists` | `tepin migrate` writes only to fresh paths — it never overwrites a file. |
+| `migration_failed` | The migrated copy failed verification against the source; the original is untouched. |
 | `model_download_failed` | The embedding model could not be fetched into the shared cache. |
 | `checksum_mismatch` | A downloaded or cached model file failed its pinned SHA-256 check. |
 | `model_load_failed` | The model files exist but onnxruntime/tokenizer could not load them. |

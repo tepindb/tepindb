@@ -23,12 +23,12 @@ use crate::embed::{cosine, Embedder, Embedding};
 use crate::error::{Result, TepinError};
 
 /// Persistent embed queue: key = "collection\0id". Survives crashes.
-const PENDING: TableDefinition<&str, &[u8]> = TableDefinition::new("__tepin_pending");
+pub(crate) const PENDING: TableDefinition<&str, &[u8]> = TableDefinition::new("__tepin_pending");
 /// Meta key recording which model produced this file's vectors.
-const EMBEDDER_KEY: &str = "embedder";
+pub(crate) const EMBEDDER_KEY: &str = "embedder";
 const BATCH: usize = 16;
 
-fn vec_table(name: &str) -> String {
+pub(crate) fn vec_table(name: &str) -> String {
     format!("vec:{name}")
 }
 
@@ -40,11 +40,11 @@ fn pending_key(collection: &str, id: &str) -> String {
 /// control characters (validated on insert), so the separator is
 /// unambiguous. A key without a separator is a pre-chunking row read as
 /// chunk 0 — old files keep working without migration.
-fn chunk_key(id: &str, idx: usize) -> String {
+pub(crate) fn chunk_key(id: &str, idx: usize) -> String {
     format!("{id}\u{0}{idx}")
 }
 
-fn parse_chunk_key(key: &str) -> (&str, u32) {
+pub(crate) fn parse_chunk_key(key: &str) -> (&str, u32) {
     match key.rsplit_once('\u{0}') {
         Some((id, idx)) => match idx.parse() {
             Ok(i) => (id, i),
