@@ -59,7 +59,9 @@ HOW TO WORK WITH IT (humans and AI agents alike)
   npx tepindb query  <this-file> <collection> '{{"field": "value"}}'
       MongoDB-style JSON filters. Answers in JSON.
   npx tepindb search <this-file> "any natural language query"
-      Semantic vector search across embedded collections.
+      Semantic vector search across embedded collections. Needs the full
+      build — npx ships the slim binary (no model); run
+      `cargo install tepin-cli` for search. `query` works everywhere.
   npx tepindb insert <this-file> <collection> '{{"any": "json"}}'
   npx tepindb update <this-file> <collection> <id> '{{"any": "json"}}'
   npx tepindb delete <this-file> <collection> <id>
