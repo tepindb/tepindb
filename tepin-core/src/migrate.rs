@@ -80,7 +80,7 @@ pub fn migrate_file(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Migr
     // bytes, and migrate from the snapshot. Opening src through redb would
     // write engine bookkeeping into it — snapshotting keeps "untouched"
     // literal, down to the byte.
-    let src_file = std::fs::File::open(src)?;
+    let mut src_file = std::fs::File::open(src)?;
     if let Err(e) = src_file.try_lock() {
         return Err(TepinError::new(
             "database_locked",
@@ -94,7 +94,15 @@ pub fn migrate_file(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Migr
         os.push(".migrate-src");
         std::path::PathBuf::from(os)
     };
-    std::fs::copy(src, &snapshot)?;
+    // Copy through the locked handle itself: on Windows the lock is
+    // mandatory, so a second handle (fs::copy) would be refused reads on
+    // the very file we just locked.
+    {
+        use std::io::Seek;
+        let mut out = std::fs::File::create(&snapshot)?;
+        src_file.seek(std::io::SeekFrom::Start(0))?;
+        std::io::copy(&mut src_file, &mut out)?;
+    }
 
     let result = (|| {
         let src_db = Db::open(&snapshot)?;
