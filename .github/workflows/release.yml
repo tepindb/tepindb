@@ -274,7 +274,10 @@ jobs:
               echo "$name@$ver already on npm — skipping"
               continue
             fi
-            if ! npm publish "$pkg" --provenance --access public; then
+            # Leading ./ is REQUIRED: `npm publish npm/tepindb` parses the
+            # two-segment path as the github shorthand npm/tepindb and tries
+            # to git-clone it; ./ forces a filesystem-path read.
+            if ! npm publish "./$pkg" --provenance --access public; then
               echo "::warning::failed to publish $name@$ver"
               failed="$failed $name"
             fi
