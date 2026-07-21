@@ -196,7 +196,7 @@ jobs:
           done
 
   npm:
-    name: npm — publish tepindb, tepin, tepindb-<platform>
+    name: npm — publish tepindb + tepindb-<platform>
     needs: [binaries]
     runs-on: ubuntu-latest
     permissions:
@@ -249,8 +249,8 @@ jobs:
         run: node npm/stamp.mjs "${RELEASE_TAG#v}"
 
       # Publish order: platform packages the main one depends on, then the
-      # main package + alias. optionalDependencies are optional, so a brief
-      # window where tepindb is live before a platform binary is fine.
+      # main package. optionalDependencies are optional, so a brief window
+      # where tepindb is live before a platform binary is fine.
       # win32-x64 goes LAST: npm's spam heuristic flagged it on a new
       # account publishing several prefixed packages fast, so we give the
       # important names their best shot first and let it fail in isolation.
@@ -267,7 +267,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           failed=""
-          for pkg in npm/platform/darwin-arm64 npm/platform/linux-x64 npm/tepindb npm/tepin npm/platform/win32-x64; do
+          for pkg in npm/platform/darwin-arm64 npm/platform/linux-x64 npm/tepindb npm/platform/win32-x64; do
             name=$(node -p "require('./$pkg/package.json').name")
             ver=$(node -p "require('./$pkg/package.json').version")
             if curl -sf -A "tepindb-release-workflow" "https://registry.npmjs.org/$name/$ver" > /dev/null; then

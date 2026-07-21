@@ -16,7 +16,6 @@ if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version ?? "")) {
 const npmDir = dirname(fileURLToPath(import.meta.url));
 const manifests = [
   "tepindb/package.json",
-  "tepin/package.json",
   "platform/darwin-arm64/package.json",
   "platform/linux-x64/package.json",
   "platform/win32-x64/package.json",
