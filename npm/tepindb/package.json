@@ -28,8 +28,8 @@
     "node": ">=22"
   },
   "optionalDependencies": {
-    "@tepindb/darwin-arm64": "0.0.0-dev",
-    "@tepindb/linux-x64": "0.0.0-dev",
-    "@tepindb/win32-x64": "0.0.0-dev"
+    "tepindb-darwin-arm64": "0.0.0-dev",
+    "tepindb-linux-x64": "0.0.0-dev",
+    "tepindb-win32-x64": "0.0.0-dev"
   }
 }

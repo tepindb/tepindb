@@ -1,5 +1,5 @@
 {
-  "name": "@tepindb/darwin-arm64",
+  "name": "tepindb-darwin-arm64",
   "version": "0.0.0-dev",
   "description": "tepin CLI binary for macOS arm64 (installed via the tepindb package)",
   "license": "MIT OR Apache-2.0",

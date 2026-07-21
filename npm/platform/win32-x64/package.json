@@ -1,5 +1,5 @@
 {
-  "name": "@tepindb/win32-x64",
+  "name": "tepindb-win32-x64",
   "version": "0.0.0-dev",
   "description": "tepin CLI binary for Windows x64 (installed via the tepindb package)",
   "license": "MIT OR Apache-2.0",

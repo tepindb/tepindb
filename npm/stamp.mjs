@@ -27,7 +27,7 @@ for (const file of manifests) {
   pkg.version = version;
   for (const section of ["dependencies", "optionalDependencies"]) {
     for (const name of Object.keys(pkg[section] ?? {})) {
-      if (name === "tepindb" || name.startsWith("@tepindb/")) {
+      if (name === "tepindb" || name.startsWith("tepindb-")) {
         pkg[section][name] = version;
       }
     }

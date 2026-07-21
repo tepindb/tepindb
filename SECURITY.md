@@ -18,7 +18,7 @@ HuggingFace, no CDN) in the runtime.
 
 **Release artifacts.** All binaries and models ship from GitHub releases,
 with an SBOM attached to every release. The npm packages (`tepindb`,
-`tepin`, `@tepindb/*`) are published by the same release workflow from the
+`tepin`, `tepindb-<platform>`) are published by the same release workflow from the
 same tag, with npm provenance attestations linking each package back to
 this repository and workflow run; the binary inside a platform package is
 byte-identical to the `tepin-slim-*` asset on the corresponding GitHub

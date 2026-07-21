@@ -94,7 +94,7 @@ jobs:
           "ASSETS=$exe $exe.sha256" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
       # Slim build: no ONNX, small binary — this is what ships to npm as
-      # @tepindb/<platform>. Built after the full binary, so target/release/
+      # tepindb-<platform>. Built after the full binary, so target/release/
       # tepin now refers to the slim one.
       - name: Build slim binary (npm)
         run: cargo build --release -p tepin-cli --no-default-features
@@ -196,7 +196,7 @@ jobs:
           done
 
   npm:
-    name: npm — publish tepindb, tepin, @tepindb/*
+    name: npm — publish tepindb, tepin, tepindb-<platform>
     needs: [binaries]
     runs-on: ubuntu-latest
     permissions:

@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 // Launcher for the tepin CLI: resolves the platform-specific binary shipped
-// in an @tepindb/* optionalDependency and execs it with the caller's args.
+// in a tepindb-<platform> optionalDependency and execs it with the caller's args.
 // The binary is the slim build (no ONNX) — semantic search needs the full
 // binary from GitHub releases or `cargo install tepin-cli`.
 
 const { spawnSync } = require("node:child_process");
 
 const PLATFORM_PACKAGES = {
-  "darwin arm64": "@tepindb/darwin-arm64",
-  "linux x64": "@tepindb/linux-x64",
-  "win32 x64": "@tepindb/win32-x64",
+  "darwin arm64": "tepindb-darwin-arm64",
+  "linux x64": "tepindb-linux-x64",
+  "win32 x64": "tepindb-win32-x64",
 };
 
 function resolveBinary() {

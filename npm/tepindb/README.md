@@ -18,7 +18,7 @@ install the full binary from
 [GitHub releases](https://github.com/tepindb/tepindb/releases) or
 `cargo install tepin-cli`.
 
-The platform binary is installed via an `@tepindb/*` optionalDependency;
+The platform binary is installed via a `tepindb-<platform>` optionalDependency;
 all binaries are built and published from the project's release workflow.
 See the [repository](https://github.com/tepindb/tepindb) for docs, and
 SECURITY.md there for the supply-chain story.
