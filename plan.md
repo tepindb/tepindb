@@ -11,8 +11,9 @@ AI-first, single-file micro-database for CLI tools and agents. Rust core on redb
 3. **Rust driver** — ✅ `tepindb` crate: `open` / `open_auto` / custom embedders; example app + examples.
 4. **Tooling** — ✅ `tepin mcp` server, CLI search, npx packaging (`npm/`: tepindb + tepindb-<platform> packages, published with provenance from release.yml). Published: crates 0.3.2, npm tepindb 0.3.2 (+ darwin/linux platform pkgs). Pending: npm win32-x64 (spam-flagged, awaiting resolution).
 5. **Primitives tier (0.3.0)** — tepindb-minimal: BYO vectors (manual mode, raw KNN, readback), public keyword scores, cross-collection batch transactions, `open_in_memory`, secondary indexes (equality-first, redb index tables). tepindb-full stays the zero-config RAG.
-6. **Dogfood** — replace sqlite in Engram with TepinDB, on the primitives tier.
-7. **Drivers** — Go / TS / Python.
+6. **Dogfood** — ✅ replace sqlite in Engram with TepinDB, on the primitives tier (Engram milestone 6, 2026-07-20).
+7. **Engram dossier (0.4.0)** — the first production integrator's requirements, all in one release: **serving** (multi-process reads via in-driver IPC, `docs/serving.md`, phase 1 full — no write-forwarding), **`tepin migrate`** (infrastructure + fixtures + CI + stability policy; no format break yet), embedder **unpin/reset**, purposed-but-empty reads return `Ok(empty)`, native **upsert** (incl. batch), optional **unique** secondary indexes, open-with-retry/backoff.
+8. **Drivers** — Go / TS / Python.
 
 ## Open questions
 

@@ -180,3 +180,36 @@ fn search_on_a_missing_file_is_a_clean_error() {
     assert_eq!(err["error"]["code"], "file_not_found");
     assert!(!db.exists());
 }
+
+#[test]
+fn upsert_inserts_then_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("up.tepin");
+
+    let out = tepin()
+        .args(["upsert"])
+        .arg(&db)
+        .args(["notes", r#"{"_id": "n1", "status": "open"}"#])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(json_stdout(&out)["upserted"], "n1");
+
+    let out = tepin()
+        .args(["upsert"])
+        .arg(&db)
+        .args(["notes", r#"{"_id": "n1", "status": "closed"}"#])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let out = tepin()
+        .args(["query"])
+        .arg(&db)
+        .args(["notes"])
+        .output()
+        .unwrap();
+    let body = json_stdout(&out);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["docs"][0]["status"], "closed");
+}

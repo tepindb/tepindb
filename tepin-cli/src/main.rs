@@ -1,6 +1,6 @@
 //! The `tepin` CLI. Every command answers in JSON (inspect answers in
 //! markdown); every error is `{"error": {code, message, hint}}` on stderr.
-//! The CLI and the MCP server expose the same six operations with identical
+//! The CLI and the MCP server expose the same operations with identical
 //! behavior — one surface to learn.
 
 mod mcp;
@@ -65,6 +65,15 @@ enum Command {
         file: FileArg,
         collection: String,
         /// The document, e.g. '{"title": "hello"}'
+        doc: String,
+    },
+    /// Insert-or-replace by _id: replaces an existing document with the
+    /// same _id, inserts otherwise
+    Upsert {
+        #[command(flatten)]
+        file: FileArg,
+        collection: String,
+        /// The document, e.g. '{"_id": "n1", "title": "hello"}'
         doc: String,
     },
     /// Fetch one document by id
@@ -166,6 +175,16 @@ fn run(cli: Cli) -> Result<(), TepinError> {
             let doc: Value = serde_json::from_str(&doc)?;
             let id = db.insert(&collection, doc)?;
             emit(&json!({"inserted": id, "collection": collection}));
+        }
+        Command::Upsert {
+            file,
+            collection,
+            doc,
+        } => {
+            let db = Db::open(&file.file)?;
+            let doc: Value = serde_json::from_str(&doc)?;
+            let id = db.upsert(&collection, doc)?;
+            emit(&json!({"upserted": id, "collection": collection}));
         }
         Command::Get {
             file,

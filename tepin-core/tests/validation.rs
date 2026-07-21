@@ -361,3 +361,38 @@ fn second_open_of_a_locked_file_errors_gracefully() {
     db1.insert("l", json!({"v": 2})).unwrap();
     assert_eq!(db1.find("l", &json!({})).unwrap().len(), 2);
 }
+
+#[test]
+fn open_with_retry_waits_out_a_cold_start_race() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raced.tepin");
+    let db1 = Db::open(&path).unwrap();
+
+    // A too-short retry budget still ends in database_locked.
+    let err = Db::options()
+        .retry_for(std::time::Duration::from_millis(30))
+        .open(&path)
+        .unwrap_err();
+    assert_eq!(err.code, "database_locked");
+
+    // Releasing the lock mid-retry lets the second opener through.
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(db1);
+    });
+    let db2 = Db::options()
+        .retry_for(std::time::Duration::from_secs(5))
+        .open(&path)
+        .unwrap();
+    db2.insert("l", json!({"v": 1})).unwrap();
+    holder.join().unwrap();
+
+    // Errors other than the lock never trigger the retry loop.
+    let missing = dir.path().join("nope").join("deep.tepin");
+    let t0 = std::time::Instant::now();
+    assert!(Db::options()
+        .retry_for(std::time::Duration::from_secs(5))
+        .open(&missing)
+        .is_err());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+}

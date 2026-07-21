@@ -28,6 +28,6 @@ mod index;
 mod vector;
 
 pub use chunk::chunk_text;
-pub use db::{BatchOp, CollectionInfo, CollectionMeta, Db};
+pub use db::{BatchOp, CollectionInfo, CollectionMeta, Db, OpenOptions};
 pub use error::{Result, TepinError};
 pub use vector::{KeywordHit, SearchHit, VectorHit};

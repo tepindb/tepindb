@@ -4,7 +4,6 @@
 //! a small meta record — free-text purpose, embed config — stored inside
 //! the database file itself: there is no external config, ever.
 
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
@@ -36,6 +35,16 @@ pub struct CollectionMeta {
     /// Fields with a secondary (equality) index.
     #[serde(default)]
     pub indexes: Vec<String>,
+    /// The subset of `indexes` that also enforce uniqueness (null-valued
+    /// and missing fields are exempt, SQL-style).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unique: Vec<String>,
+}
+
+impl CollectionMeta {
+    pub(crate) fn is_unique(&self, field: &str) -> bool {
+        self.unique.iter().any(|f| f == field)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +56,8 @@ pub struct CollectionInfo {
     pub manual_vectors: bool,
     /// Fields with a secondary (equality) index.
     pub indexes: Vec<String>,
+    /// The subset of `indexes` that also enforce uniqueness.
+    pub unique: Vec<String>,
     pub count: u64,
 }
 
@@ -54,6 +65,11 @@ pub struct CollectionInfo {
 #[derive(Debug, Clone)]
 pub enum BatchOp {
     Insert {
+        collection: String,
+        doc: Value,
+    },
+    /// Insert-or-replace by `_id` — see [`Db::upsert`].
+    Upsert {
         collection: String,
         doc: Value,
     },
@@ -80,6 +96,21 @@ pub(crate) fn collection_meta_in_txn(
     Ok(json
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default())
+}
+
+/// Whether a collection has a meta record. It may still have no data table:
+/// `set_purpose` / `create_index` / embed config all register a collection
+/// before its first insert, and reads on such a collection are empty, not
+/// `collection_not_found`.
+fn is_configured(txn: &redb::ReadTransaction, collection: &str) -> Result<bool> {
+    let meta = match txn.open_table(META) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(meta
+        .get(format!("{COLLECTION_PREFIX}{collection}").as_str())?
+        .is_some())
 }
 
 pub struct Db {
@@ -175,7 +206,7 @@ impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
-        let mut file = OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -235,6 +266,12 @@ impl Db {
             ));
         }
         Self::open(path)
+    }
+
+    /// Start building an open call with options — retry, and (eventually)
+    /// anything else `open` itself shouldn't grow a parameter for.
+    pub fn options() -> OpenOptions {
+        OpenOptions::default()
     }
 
     /// Insert a JSON object; returns its id. Assigns a short sortable `_id`
@@ -297,10 +334,54 @@ impl Db {
         }
         for field in &cm.indexes {
             for (id, doc) in ids.iter().zip(&stored_docs) {
-                crate::index::index_add(txn, collection, field, doc, id)?;
+                crate::index::index_add(txn, collection, field, doc, id, cm.is_unique(field))?;
             }
         }
         Ok(ids)
+    }
+
+    /// Insert-or-replace by `_id`: a document whose `_id` already exists is
+    /// replaced (update semantics — indexes swap, embeddings re-queue);
+    /// anything else inserts, minting an id when the document has none.
+    /// Returns the document's id either way.
+    pub fn upsert(&self, collection: &str, doc: Value) -> Result<String> {
+        let txn = self.core.db.begin_write()?;
+        let id = self.upsert_in_txn(&txn, collection, doc)?;
+        txn.commit()?;
+        self.nudge_embed();
+        Ok(id)
+    }
+
+    fn upsert_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        collection: &str,
+        doc: Value,
+    ) -> Result<String> {
+        validate_collection_name(collection)?;
+        // Only a stored doc under the same string `_id` routes to replace;
+        // every other shape (no _id, non-string _id, unknown id) takes the
+        // insert path, which owns the id validation.
+        let existing = match doc.get("_id") {
+            Some(Value::String(id)) => {
+                let table_name = data_table(collection);
+                let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
+                let table = txn.open_table(def)?;
+                let stored = table.get(id.as_str())?.is_some();
+                stored.then(|| id.clone())
+            }
+            _ => None,
+        };
+        match existing {
+            Some(id) => {
+                self.update_in_txn(txn, collection, &id, doc)?;
+                Ok(id)
+            }
+            None => Ok(self
+                .insert_in_txn(txn, collection, vec![doc])?
+                .pop()
+                .expect("one doc in, one id out")),
+        }
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Option<Value>> {
@@ -310,7 +391,11 @@ impl Db {
         let table = match txn.open_table(def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(self.unknown_collection(collection))
+                return if is_configured(&txn, collection)? {
+                    Ok(None) // configured, nothing inserted yet
+                } else {
+                    Err(self.unknown_collection(collection))
+                };
             }
             Err(e) => return Err(e.into()),
         };
@@ -339,7 +424,11 @@ impl Db {
         let table = match txn.open_table(def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(self.unknown_collection(collection))
+                return if is_configured(&txn, collection)? {
+                    Ok(Vec::new()) // configured, nothing inserted yet
+                } else {
+                    Err(self.unknown_collection(collection))
+                };
             }
             Err(e) => return Err(e.into()),
         };
@@ -394,12 +483,27 @@ impl Db {
     /// Create an equality index on a field (idempotent) and backfill it
     /// from every existing document. `find` uses it automatically.
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.create_index_inner(collection, field, false)
+    }
+
+    /// Create an equality index that also enforces uniqueness: a second
+    /// document with the same value is rejected (`unique_violation`).
+    /// Null-valued and missing fields are exempt, SQL-style. Backfill
+    /// verifies existing documents — duplicates fail the whole call.
+    pub fn create_unique_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.create_index_inner(collection, field, true)
+    }
+
+    fn create_index_inner(&self, collection: &str, field: &str, unique: bool) -> Result<()> {
         validate_collection_name(collection)?;
         let txn = self.core.db.begin_write()?;
         {
             let mut cm = collection_meta_in_txn(&txn, collection)?;
             if !cm.indexes.iter().any(|i| i == field) {
                 cm.indexes.push(field.to_string());
+            }
+            if unique && !cm.is_unique(field) {
+                cm.unique.push(field.to_string());
             }
             let mut meta = txn.open_table(META)?;
             let key = format!("{COLLECTION_PREFIX}{collection}");
@@ -424,20 +528,21 @@ impl Db {
                 Err(e) => return Err(e.into()),
             };
             for (id, doc) in &docs {
-                crate::index::index_add(&txn, collection, field, doc, id)?;
+                crate::index::index_add(&txn, collection, field, doc, id, unique)?;
             }
         }
         txn.commit()?;
         Ok(())
     }
 
-    /// Drop a field's equality index (idempotent). Data is untouched;
-    /// `find` falls back to scanning.
+    /// Drop a field's equality index (idempotent), unique or not. Data is
+    /// untouched; `find` falls back to scanning.
     pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
         let txn = self.core.db.begin_write()?;
         {
             let mut cm = collection_meta_in_txn(&txn, collection)?;
             cm.indexes.retain(|i| i != field);
+            cm.unique.retain(|i| i != field);
             let mut meta = txn.open_table(META)?;
             let key = format!("{COLLECTION_PREFIX}{collection}");
             meta.insert(key.as_str(), serde_json::to_string(&cm)?.as_str())?;
@@ -509,7 +614,7 @@ impl Db {
             if let Some(old) = &old_doc {
                 crate::index::index_remove(txn, collection, field, old, id)?;
             }
-            crate::index::index_add(txn, collection, field, &doc, id)?;
+            crate::index::index_add(txn, collection, field, &doc, id, cm.is_unique(field))?;
         }
         Ok(())
     }
@@ -562,7 +667,7 @@ impl Db {
 
     /// Apply a mixed sequence of writes across any collections in ONE
     /// atomic transaction: either every operation lands or none does.
-    /// Returns the ids of inserted documents, in operation order.
+    /// Returns the ids of inserted and upserted documents, in operation order.
     pub fn batch(&self, ops: Vec<BatchOp>) -> Result<Vec<String>> {
         let txn = self.core.db.begin_write()?;
         let mut inserted = Vec::new();
@@ -570,6 +675,9 @@ impl Db {
             match op {
                 BatchOp::Insert { collection, doc } => {
                     inserted.extend(self.insert_in_txn(&txn, &collection, vec![doc])?);
+                }
+                BatchOp::Upsert { collection, doc } => {
+                    inserted.push(self.upsert_in_txn(&txn, &collection, doc)?);
                 }
                 BatchOp::Update {
                     collection,
@@ -616,6 +724,7 @@ impl Db {
                 embed: cm.embed,
                 manual_vectors: cm.manual_vectors,
                 indexes: cm.indexes,
+                unique: cm.unique,
                 count,
             });
         }
@@ -715,9 +824,54 @@ fn matches_filter(doc: &Value, filter: &serde_json::Map<String, Value>) -> Resul
     Ok(true)
 }
 
+/// Options for opening a database. Built via [`Db::options`]:
+///
+/// ```no_run
+/// # use tepin_core::Db;
+/// # use std::time::Duration;
+/// let db = Db::options()
+///     .retry_for(Duration::from_secs(2))
+///     .open("memory.tepin")?;
+/// # Ok::<(), tepin_core::TepinError>(())
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct OpenOptions {
+    retry_for: Option<std::time::Duration>,
+}
+
+impl OpenOptions {
+    /// Keep retrying a `database_locked` open with backoff for up to this
+    /// long — the cure for two processes racing to open at cold start.
+    /// Any other error still fails immediately.
+    pub fn retry_for(mut self, wait: std::time::Duration) -> Self {
+        self.retry_for = Some(wait);
+        self
+    }
+
+    /// Open a .tepin file with these options, creating it if absent.
+    pub fn open(&self, path: impl AsRef<Path>) -> Result<Db> {
+        let path = path.as_ref();
+        let deadline = self.retry_for.map(|w| std::time::Instant::now() + w);
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            match Db::open(path) {
+                Err(e) if e.code == "database_locked" => {
+                    let retry = deadline.is_some_and(|d| std::time::Instant::now() + delay <= d);
+                    if !retry {
+                        return Err(e);
+                    }
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(250));
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
 /// Mongo-style equality: numbers compare numerically (5 == 5.0),
 /// everything else compares structurally.
-fn values_equal(a: &Value, b: &Value) -> bool {
+pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
             (Some(x), Some(y)) => x == y,

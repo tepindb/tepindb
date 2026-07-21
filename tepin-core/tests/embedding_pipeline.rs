@@ -181,6 +181,38 @@ fn model_provenance_is_enforced() {
 }
 
 #[test]
+fn reset_embedder_requeues_auto_collections_for_the_new_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swap.tepin");
+    let id;
+    {
+        let db = open_with_mock(&path);
+        db.set_embed_fields("notes", &["title"]).unwrap();
+        id = db
+            .insert("notes", json!({"title": "survives the swap"}))
+            .unwrap();
+        db.flush_embeddings().unwrap();
+
+        // Reset is refused while an embedder is attached — its worker
+        // could race the reset and re-pin the old model.
+        let err = db.reset_embedder().unwrap_err();
+        assert_eq!(err.code, "embedder_already_attached");
+    }
+
+    // Fresh handle, no embedder: reset clears the pin and re-queues.
+    let mut db = Db::open(&path).unwrap();
+    db.reset_embedder().unwrap();
+    assert!(db.pending_embeddings().unwrap() > 0);
+
+    // The previously incompatible model (dim 32 vs 16) now attaches and
+    // heals the queue; search works end to end on the new vectors.
+    db.attach_embedder(Arc::new(MockEmbedder::new(32))).unwrap();
+    db.flush_embeddings().unwrap();
+    let hits = db.search(Some("notes"), "survives the swap", 1).unwrap();
+    assert_eq!(hits[0].id, id);
+}
+
+#[test]
 fn search_errors_are_specific() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_with_mock(&dir.path().join("t.tepin"));

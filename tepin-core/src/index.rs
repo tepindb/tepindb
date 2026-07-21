@@ -10,10 +10,10 @@
 //! same key (Mongo-style numeric equality); a missing field indexes as
 //! null, matching the filter semantics.
 
-use redb::TableDefinition;
+use redb::{ReadableTable, TableDefinition};
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::error::{Result, TepinError};
 
 fn idx_table(collection: &str, field: &str) -> String {
     format!("idx:{collection}:{field}")
@@ -69,12 +69,65 @@ pub(crate) fn index_add(
     field: &str,
     doc: &Value,
     id: &str,
+    unique: bool,
 ) -> Result<()> {
     let value = doc.get(field).unwrap_or(&Value::Null);
+    // Null (and missing) values are exempt from uniqueness, SQL-style.
+    if unique && !value.is_null() {
+        if let Some(holder) = unique_holder(txn, collection, field, value, id)? {
+            return Err(TepinError::new(
+                "unique_violation",
+                format!(
+                    "collection {collection:?} already has a document with {field} = {value} (id {holder:?})"
+                ),
+                "update the existing document instead, or drop the unique index if duplicates are intended",
+            ));
+        }
+    }
     let name = idx_table(collection, field);
     let mut table = txn.open_table(def(&name))?;
     table.insert(entry_key(value, id).as_str(), [].as_slice())?;
     Ok(())
+}
+
+/// The id of another document already holding `value` under a unique index,
+/// if any. Index keys are hashes, so every same-hash entry is re-verified
+/// against its stored document — a collision must never fake a violation.
+fn unique_holder(
+    txn: &redb::WriteTransaction,
+    collection: &str,
+    field: &str,
+    value: &Value,
+    id: &str,
+) -> Result<Option<String>> {
+    let name = idx_table(collection, field);
+    let table = txn.open_table(def(&name))?;
+    let start = format!("{}\u{0}", value_hash(value));
+    let end = format!("{}\u{1}", value_hash(value));
+    let mut candidates = Vec::new();
+    for entry in table.range(start.as_str()..end.as_str())? {
+        let (key, _) = entry?;
+        if let Some((_, other)) = key.value().split_once('\u{0}') {
+            if other != id {
+                candidates.push(other.to_string());
+            }
+        }
+    }
+    drop(table);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let data = txn.open_table(def(&crate::db::data_table(collection)))?;
+    for other in candidates {
+        if let Some(bytes) = data.get(other.as_str())? {
+            let doc: Value = serde_json::from_slice(bytes.value())?;
+            let stored = doc.get(field).unwrap_or(&Value::Null);
+            if crate::db::values_equal(stored, value) {
+                return Ok(Some(other));
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn index_remove(

@@ -129,6 +129,18 @@ fn dispatch(db: &mut Db, file: &Path, name: &str, args: &Value) -> Result<String
             let id = db.insert(col, doc)?;
             Ok(json!({"inserted": id, "collection": col}).to_string())
         }
+        "upsert" => {
+            let doc = args.get("doc").cloned().ok_or_else(|| {
+                TepinError::new(
+                    "invalid_document",
+                    "missing required argument 'doc'",
+                    "pass the document as a JSON object; give it an _id to replace an existing one",
+                )
+            })?;
+            let col = collection()?;
+            let id = db.upsert(col, doc)?;
+            Ok(json!({"upserted": id, "collection": col}).to_string())
+        }
         "update" => {
             let doc = args.get("doc").cloned().ok_or_else(|| {
                 TepinError::new(
@@ -248,6 +260,14 @@ fn tool_defs() -> Value {
             "inputSchema": {"type": "object", "properties": {
                 "collection": collection,
                 "doc": {"type": "object", "description": "The document"}
+            }, "required": ["collection", "doc"]}
+        },
+        {
+            "name": "upsert",
+            "description": "Insert-or-replace by _id: replaces the existing document with the same _id, inserts otherwise (minting an _id if the doc has none).",
+            "inputSchema": {"type": "object", "properties": {
+                "collection": collection,
+                "doc": {"type": "object", "description": "The document; include _id to target an existing one"}
             }, "required": ["collection", "doc"]}
         },
         {

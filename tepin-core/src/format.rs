@@ -63,6 +63,7 @@ HOW TO WORK WITH IT (humans and AI agents alike)
       build — npx ships the slim binary (no model); run
       `cargo install tepin-cli` for search. `query` works everywhere.
   npx tepindb insert <this-file> <collection> '{{"any": "json"}}'
+  npx tepindb upsert <this-file> <collection> '{{"_id": "x", ...}}'
   npx tepindb update <this-file> <collection> <id> '{{"any": "json"}}'
   npx tepindb delete <this-file> <collection> <id>
   npx tepindb mcp    <this-file>

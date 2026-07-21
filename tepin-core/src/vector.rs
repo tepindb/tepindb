@@ -648,6 +648,53 @@ impl Db {
         Ok(hits)
     }
 
+    /// Clear this file's embedder pin and every stored vector — the
+    /// model-swap escape hatch, no full-file rebuild needed. Documents and
+    /// the keyword index are untouched. Auto-embed collections are fully
+    /// re-queued, so the next attached embedder rebuilds their vectors;
+    /// manual collections need fresh `set_vectors` calls. Refused while an
+    /// embedder is attached: its worker could race the reset and re-pin
+    /// the old model — reset first, then attach the new one.
+    pub fn reset_embedder(&self) -> Result<()> {
+        if self.embed.is_some() {
+            return Err(TepinError::new(
+                "embedder_already_attached",
+                "reset_embedder needs a handle without an embedder attached",
+                "open the file, call reset_embedder, then attach the new model",
+            ));
+        }
+        let all = self.collections()?;
+        let txn = self.core.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            meta.remove(EMBEDDER_KEY)?;
+        }
+        for col in &all {
+            let name = vec_table(&col.name);
+            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&name);
+            txn.delete_table(def)?;
+        }
+        txn.delete_table(PENDING)?;
+        for col in &all {
+            if col.embed.is_empty() || col.manual_vectors {
+                continue;
+            }
+            let name = data_table(&col.name);
+            let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&name);
+            let ids: Vec<String> = match txn.open_table(def) {
+                Ok(t) => t
+                    .iter()?
+                    .map(|e| e.map(|(k, _)| k.value().to_string()))
+                    .collect::<std::result::Result<_, _>>()?,
+                Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+                Err(e) => return Err(e.into()),
+            };
+            queue_pending(&txn, &col.name, &ids)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn nudge_embed(&self) {
         if let Some(rt) = &self.embed {
             rt.nudge();

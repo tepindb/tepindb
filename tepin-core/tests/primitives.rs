@@ -222,3 +222,172 @@ fn index_follows_updates_deletes_and_numeric_equality() {
     db.insert("docs", json!({"n": 1})).unwrap();
     assert_eq!(db.find("docs", &json!({"status": null})).unwrap().len(), 1);
 }
+
+#[test]
+fn configured_but_empty_collections_read_as_empty() {
+    let db = Db::open_in_memory().unwrap();
+    db.set_purpose("planned", "docs that will exist later")
+        .unwrap();
+    db.set_manual_vectors("vectors", &["title"]).unwrap();
+    db.create_index("indexed", "field").unwrap();
+
+    // The configure-then-read pattern: configured collections are empty,
+    // not collection_not_found.
+    for col in ["planned", "vectors", "indexed"] {
+        assert_eq!(db.get(col, "ghost").unwrap(), None);
+        assert!(db.find(col, &json!({})).unwrap().is_empty());
+    }
+
+    // A never-mentioned collection still errors.
+    let err = db.get("nope", "ghost").unwrap_err();
+    assert_eq!(err.code, "collection_not_found");
+    let err = db.find("nope", &json!({})).unwrap_err();
+    assert_eq!(err.code, "collection_not_found");
+}
+
+#[test]
+fn upsert_inserts_then_replaces_by_id() {
+    let db = Db::open_in_memory().unwrap();
+    db.create_index("nodes", "status").unwrap();
+
+    // No _id: plain insert with a minted id.
+    let a = db.upsert("nodes", json!({"title": "first"})).unwrap();
+    assert_eq!(db.get("nodes", &a).unwrap().unwrap()["title"], "first");
+
+    // Unknown explicit _id: insert under that id.
+    let b = db
+        .upsert("nodes", json!({"_id": "n1", "status": "open"}))
+        .unwrap();
+    assert_eq!(b, "n1");
+
+    // Known _id: full replace, and the index follows.
+    db.upsert("nodes", json!({"_id": "n1", "status": "closed"}))
+        .unwrap();
+    assert_eq!(db.find("nodes", &json!({})).unwrap().len(), 2);
+    assert!(db
+        .find("nodes", &json!({"status": "open"}))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.find("nodes", &json!({"status": "closed"}))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // In a batch, upserts return their ids alongside inserted ones.
+    let ids = db
+        .batch(vec![
+            BatchOp::Upsert {
+                collection: "nodes".into(),
+                doc: json!({"_id": "n1", "status": "reopened"}),
+            },
+            BatchOp::Insert {
+                collection: "nodes".into(),
+                doc: json!({"title": "third"}),
+            },
+        ])
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], "n1");
+    assert_eq!(
+        db.get("nodes", "n1").unwrap().unwrap()["status"],
+        "reopened"
+    );
+
+    // Invalid _id shapes still fail like insert.
+    let err = db.upsert("nodes", json!({"_id": 7})).unwrap_err();
+    assert_eq!(err.code, "invalid_document");
+}
+
+#[test]
+fn unique_index_rejects_duplicates_but_not_nulls() {
+    let db = Db::open_in_memory().unwrap();
+    db.create_unique_index("suspects", "pair").unwrap();
+
+    db.insert("suspects", json!({"pair": "a\u{1}b"})).unwrap();
+    let err = db
+        .insert("suspects", json!({"pair": "a\u{1}b"}))
+        .unwrap_err();
+    assert_eq!(err.code, "unique_violation");
+
+    // Nulls and missing fields are exempt, SQL-style.
+    db.insert("suspects", json!({"pair": null})).unwrap();
+    db.insert("suspects", json!({"pair": null})).unwrap();
+    db.insert("suspects", json!({"other": 1})).unwrap();
+
+    // Updating into a taken value fails; updating the holder itself is fine.
+    let free = db.insert("suspects", json!({"pair": "c\u{1}d"})).unwrap();
+    let err = db
+        .update("suspects", &free, json!({"pair": "a\u{1}b"}))
+        .unwrap_err();
+    assert_eq!(err.code, "unique_violation");
+    db.update("suspects", &free, json!({"pair": "c\u{1}d", "seen": true}))
+        .unwrap();
+
+    // Upsert-replace of the holder keeps its value without tripping.
+    db.upsert("suspects", json!({"_id": free, "pair": "c\u{1}d"}))
+        .unwrap();
+
+    // A failed unique write rolls the whole batch back.
+    let err = db
+        .batch(vec![
+            BatchOp::Insert {
+                collection: "audit".into(),
+                doc: json!({"x": 1}),
+            },
+            BatchOp::Insert {
+                collection: "suspects".into(),
+                doc: json!({"pair": "a\u{1}b"}),
+            },
+        ])
+        .unwrap_err();
+    assert_eq!(err.code, "unique_violation");
+    let err = db.find("audit", &json!({})).unwrap_err();
+    assert_eq!(err.code, "collection_not_found");
+
+    // Dropping the unique index lifts the constraint.
+    db.drop_index("suspects", "pair").unwrap();
+    db.insert("suspects", json!({"pair": "a\u{1}b"})).unwrap();
+}
+
+#[test]
+fn unique_backfill_refuses_existing_duplicates() {
+    let db = Db::open_in_memory().unwrap();
+    db.insert("nodes", json!({"slug": "same"})).unwrap();
+    db.insert("nodes", json!({"slug": "same"})).unwrap();
+    let err = db.create_unique_index("nodes", "slug").unwrap_err();
+    assert_eq!(err.code, "unique_violation");
+    // The failed call must not leave a half-created index behind.
+    let cols = db.collections().unwrap();
+    assert!(cols[0].indexes.is_empty());
+    assert!(cols[0].unique.is_empty());
+}
+
+#[test]
+fn reset_embedder_unpins_the_model_for_a_swap() {
+    let db = Db::open_in_memory().unwrap();
+    db.set_manual_vectors("nodes", &["title"]).unwrap();
+    let id = db.insert("nodes", json!({"title": "hello"})).unwrap();
+    db.set_vectors("nodes", &id, "old-model", &[vec![1.0, 0.0]])
+        .unwrap();
+
+    // The pin blocks a different model — this is the wall reset removes.
+    let err = db
+        .set_vectors("nodes", &id, "new-model", &[vec![1.0, 0.0, 0.0]])
+        .unwrap_err();
+    assert_eq!(err.code, "embedder_mismatch");
+
+    db.reset_embedder().unwrap();
+    assert!(db.get_vectors("nodes", &id).unwrap().is_empty());
+
+    // Same file, new model, new dimension — no rebuild needed.
+    db.set_vectors("nodes", &id, "new-model", &[vec![0.0, 1.0, 0.0]])
+        .unwrap();
+    assert_eq!(
+        db.get_vectors("nodes", &id).unwrap(),
+        vec![vec![0.0, 1.0, 0.0]]
+    );
+    // Documents survived the reset untouched.
+    assert_eq!(db.get("nodes", &id).unwrap().unwrap()["title"], "hello");
+}

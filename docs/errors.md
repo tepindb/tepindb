@@ -23,8 +23,9 @@ never repurposed.
 | `invalid_document` | A document was valid JSON but not an object, or its `_id` was not a string. |
 | `invalid_filter` | A filter was not an object, or used an unsupported operator. |
 | `invalid_collection_name` | Collection names are 1–128 bytes with no control characters. |
-| `duplicate_id` | An insert carried an explicit `_id` that already exists (inserts never overwrite). |
-| `collection_not_found` | The named collection does not exist in this database. |
+| `duplicate_id` | An insert carried an explicit `_id` that already exists (inserts never overwrite; `upsert` replaces). |
+| `unique_violation` | A write would duplicate a value under a unique index (nulls and missing fields are exempt). |
+| `collection_not_found` | The named collection does not exist in this database (a configured-but-empty collection reads as empty instead). |
 | `doc_not_found` | No document with that id exists in the collection. |
 | `not_implemented` | The operation exists in the surface but is not wired up in this build. |
 | `model_download_failed` | The embedding model could not be fetched into the shared cache. |
