@@ -26,9 +26,13 @@ mod fts;
 mod id;
 mod index;
 pub mod migrate;
+#[cfg(feature = "serve")]
+pub(crate) mod serve;
 mod vector;
 
 pub use chunk::chunk_text;
+#[cfg(feature = "serve")]
+pub use db::ServeMode;
 pub use db::{BatchOp, CollectionInfo, CollectionMeta, Db, OpenOptions};
 pub use error::{Result, TepinError};
 pub use migrate::{migrate_file, MigrateReport};

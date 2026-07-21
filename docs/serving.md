@@ -1,7 +1,15 @@
 # Multi-process read access via in-driver serving
 
-> Status: design, targeted for implementation. Tracks the P0 "multi-process
-> read access" problem. Nothing here is built yet.
+> Status: **shipped** (phase 1, 0.4.0) — `tepin-core/src/serve/`, behind the
+> default-on `serve` feature. `ServeMode` on `Db::options()`; `tepin mcp`
+> hosts; CLI read commands discover on `database_locked`. Write-forwarding
+> (phase 2) remains unbuilt. Resolved open questions: CLI discovery is
+> automatic (it only activates on an otherwise-fatal error); the sidecar
+> lives in the runtime dir; pid-liveness checks are replaced by
+> connect-plus-nonce validation (the connect attempt IS the liveness
+> check); a remote handle surfaces itself via `Db::is_served()`. Beyond
+> the phase-1 table, the primitives-tier reads (`search_by_vector`,
+> `get_vectors`) are served too — Engram's read federation needs them.
 
 ## The problem
 

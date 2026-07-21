@@ -40,3 +40,7 @@ never repurposed.
 | `collection_not_embedded` | The collection has no embed fields configured, so it cannot be searched. |
 | `invalid_vector` | `set_vectors` got no vectors, an empty vector, or mixed dimensions in one call. |
 | `manual_vectors_disabled` | `set_vectors` works only on collections in manual vector mode (`set_manual_vectors`). |
+| `serve_failed` | A `ServeMode::Host` open could not bind its listener or write its sidecar. |
+| `serve_disconnected` | The connection to the serving process was lost mid-use; reopen to reconnect. |
+| `protocol_mismatch` | Host and client speak different serving-protocol versions; upgrade the older side. |
+| `remote_error` | A served operation failed with an error code this build does not know (version skew). |

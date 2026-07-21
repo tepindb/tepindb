@@ -162,7 +162,7 @@ fn retry_with_env_file() -> Option<Cli> {
 fn run(cli: Cli) -> Result<(), TepinError> {
     match cli.command {
         Command::Inspect { file } => {
-            let db = Db::open_existing(&file.file)?;
+            let db = open_read(&file.file)?;
             print!("{}", inspect_markdown(&db, &file.file)?);
         }
         Command::Query {
@@ -170,7 +170,7 @@ fn run(cli: Cli) -> Result<(), TepinError> {
             collection,
             filter,
         } => {
-            let db = Db::open_existing(&file.file)?;
+            let db = open_read(&file.file)?;
             let filter: Value = serde_json::from_str(&filter)?;
             let docs = db.find(&collection, &filter)?;
             emit(&json!({"count": docs.len(), "docs": docs}));
@@ -200,7 +200,7 @@ fn run(cli: Cli) -> Result<(), TepinError> {
             collection,
             id,
         } => {
-            let db = Db::open_existing(&file.file)?;
+            let db = open_read(&file.file)?;
             match db.get(&collection, &id)? {
                 Some(doc) => emit(&doc),
                 None => emit(&json!({"doc": null, "id": id})),
@@ -256,11 +256,15 @@ fn run(cli: Cli) -> Result<(), TepinError> {
             collection,
             limit,
         } => {
-            let mut db = Db::open_existing(&file.file)?;
-            let cache = tepin_embed::fetch::default_cache_dir()?;
-            let lazy =
-                tepin_embed::OnnxEmbedder::spawn_lazy(&tepin_embed::fetch::BGE_SMALL, cache);
-            db.attach_embedder(std::sync::Arc::new(lazy))?;
+            let mut db = open_read(&file.file)?;
+            // A served handle searches through the host's model; only a
+            // local handle needs its own embedder.
+            if !db.is_served() {
+                let cache = tepin_embed::fetch::default_cache_dir()?;
+                let lazy =
+                    tepin_embed::OnnxEmbedder::spawn_lazy(&tepin_embed::fetch::BGE_SMALL, cache);
+                db.attach_embedder(std::sync::Arc::new(lazy))?;
+            }
             let hits = db.search(collection.as_deref(), &query, limit)?;
             emit(&json!({"count": hits.len(), "hits": hits}));
         }
@@ -290,6 +294,15 @@ fn run(cli: Cli) -> Result<(), TepinError> {
         }
     }
     Ok(())
+}
+
+/// Read commands never create files — and when another process holds the
+/// lock, they discover its in-driver server and read through it instead
+/// of failing with database_locked (docs/serving.md).
+fn open_read(path: &std::path::Path) -> Result<Db, TepinError> {
+    Db::options()
+        .serve(tepin_core::ServeMode::Discover)
+        .open_existing(path)
 }
 
 fn emit(v: &Value) {

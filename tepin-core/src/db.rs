@@ -47,7 +47,7 @@ impl CollectionMeta {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionInfo {
     pub name: String,
     pub purpose: Option<String>,
@@ -114,11 +114,40 @@ fn is_configured(txn: &redb::ReadTransaction, collection: &str) -> Result<bool> 
 }
 
 pub struct Db {
-    pub(crate) core: std::sync::Arc<Core>,
+    pub(crate) backend: Backend,
     /// The embedding pipeline, present once an embedder is attached.
-    /// Dropped before `core`'s Arc clone count matters — the worker owns
-    /// its own Arc and is joined in EmbedRuntime::drop.
+    /// The worker owns its own Arc of the core and is joined in
+    /// EmbedRuntime::drop.
     pub(crate) embed: Option<crate::vector::EmbedRuntime>,
+    /// The in-driver serving listener, present when this handle hosts
+    /// reads for other processes (docs/serving.md).
+    #[cfg(feature = "serve")]
+    pub(crate) host: Option<crate::serve::host::HostRuntime>,
+}
+
+/// What actually answers this handle's operations: the local engine
+/// (this process holds the file lock) or a remote lock-holder serving
+/// reads over a local socket.
+pub(crate) enum Backend {
+    Local(std::sync::Arc<Core>),
+    #[cfg(feature = "serve")]
+    Remote(crate::serve::client::RemoteClient),
+}
+
+/// How `open` relates to other processes on the same file
+/// (docs/serving.md). `Off` is today's pure-embedded behavior.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServeMode {
+    /// Neither host nor discover — exclusive single-process access.
+    #[default]
+    Off,
+    /// On winning the lock, also serve reads to other processes.
+    Host,
+    /// On losing the lock, discover a serving host and read through it.
+    Discover,
+    /// Both: host when the lock is won, discover when it is lost.
+    HostOrDiscover,
 }
 
 /// The storage handle shared between the Db and the embed worker thread.
@@ -201,6 +230,40 @@ fn insert_doc(table: &mut redb::Table<&str, &[u8]>, mut doc: Value) -> Result<(S
 }
 
 impl Db {
+    /// This process holds the engine; error for handles served remotely
+    /// (every write path and the few reads serving doesn't cover).
+    pub(crate) fn local(&self) -> Result<&std::sync::Arc<Core>> {
+        match &self.backend {
+            Backend::Local(core) => Ok(core),
+            #[cfg(feature = "serve")]
+            Backend::Remote(_) => Err(TepinError::new(
+                "database_locked",
+                "another process holds the write lock; this handle reads through it",
+                "reads are served; writes and admin need the lock — close the writer or go through its surface (e.g. its MCP server)",
+            )),
+        }
+    }
+
+    /// True when this handle reads through another process's server
+    /// instead of holding the file itself.
+    pub fn is_served(&self) -> bool {
+        #[cfg(feature = "serve")]
+        {
+            matches!(self.backend, Backend::Remote(_))
+        }
+        #[cfg(not(feature = "serve"))]
+        false
+    }
+
+    fn from_core(core: Core) -> Self {
+        Self {
+            backend: Backend::Local(std::sync::Arc::new(core)),
+            embed: None,
+            #[cfg(feature = "serve")]
+            host: None,
+        }
+    }
+
     /// Open a .tepin file, creating it (with its preamble) if absent.
     /// Opening never blocks on anything heavy — models load elsewhere, later.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -237,10 +300,7 @@ impl Db {
         }
 
         let db = redb::Builder::new().create_with_backend(PreambleBackend::new(file))?;
-        Ok(Self {
-            core: std::sync::Arc::new(Core { db }),
-            embed: None,
-        })
+        Ok(Self::from_core(Core { db }))
     }
 
     /// Open a fresh in-memory database: full engine, zero disk. Made for
@@ -248,10 +308,7 @@ impl Db {
     /// drop. No file, no preamble, no lock.
     pub fn open_in_memory() -> Result<Self> {
         let db = redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?;
-        Ok(Self {
-            core: std::sync::Arc::new(Core { db }),
-            embed: None,
-        })
+        Ok(Self::from_core(Core { db }))
     }
 
     /// Open a .tepin file that must already exist — the read-path variant:
@@ -285,7 +342,7 @@ impl Db {
     /// Insert a batch atomically: either every document lands or none does.
     /// For multi-collection atomicity, see [`Db::batch`].
     pub fn insert_many(&self, collection: &str, docs: Vec<Value>) -> Result<Vec<String>> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         let ids = self.insert_in_txn(&txn, collection, docs)?;
         txn.commit()?;
         self.nudge_embed();
@@ -345,7 +402,7 @@ impl Db {
     /// anything else inserts, minting an id when the document has none.
     /// Returns the document's id either way.
     pub fn upsert(&self, collection: &str, doc: Value) -> Result<String> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         let id = self.upsert_in_txn(&txn, collection, doc)?;
         txn.commit()?;
         self.nudge_embed();
@@ -385,7 +442,11 @@ impl Db {
     }
 
     pub fn get(&self, collection: &str, id: &str) -> Result<Option<Value>> {
-        let txn = self.core.db.begin_read()?;
+        #[cfg(feature = "serve")]
+        if let Backend::Remote(r) = &self.backend {
+            return r.get(collection, id);
+        }
+        let txn = self.local()?.db.begin_read()?;
         let table_name = data_table(collection);
         let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
         let table = match txn.open_table(def) {
@@ -411,6 +472,10 @@ impl Db {
     /// of a full scan; every candidate is still verified against the full
     /// filter, so results are identical either way.
     pub fn find(&self, collection: &str, filter: &Value) -> Result<Vec<Value>> {
+        #[cfg(feature = "serve")]
+        if let Backend::Remote(r) = &self.backend {
+            return r.find(collection, filter);
+        }
         let filter_obj = filter.as_object().ok_or_else(|| {
             TepinError::new(
                 "invalid_filter",
@@ -418,7 +483,7 @@ impl Db {
                 "use {} to match everything, or {\"field\": \"value\"}",
             )
         })?;
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         let table_name = data_table(collection);
         let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&table_name);
         let table = match txn.open_table(def) {
@@ -496,7 +561,7 @@ impl Db {
 
     fn create_index_inner(&self, collection: &str, field: &str, unique: bool) -> Result<()> {
         validate_collection_name(collection)?;
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let mut cm = collection_meta_in_txn(&txn, collection)?;
             if !cm.indexes.iter().any(|i| i == field) {
@@ -538,7 +603,7 @@ impl Db {
     /// Drop a field's equality index (idempotent), unique or not. Data is
     /// untouched; `find` falls back to scanning.
     pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let mut cm = collection_meta_in_txn(&txn, collection)?;
             cm.indexes.retain(|i| i != field);
@@ -554,7 +619,7 @@ impl Db {
 
     /// Replace a document by id. The stored `_id` always wins.
     pub fn update(&self, collection: &str, id: &str, doc: Value) -> Result<()> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         self.update_in_txn(&txn, collection, id, doc)?;
         txn.commit()?;
         self.nudge_embed();
@@ -620,7 +685,7 @@ impl Db {
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<()> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         self.delete_in_txn(&txn, collection, id)?;
         txn.commit()?;
         Ok(())
@@ -669,7 +734,7 @@ impl Db {
     /// atomic transaction: either every operation lands or none does.
     /// Returns the ids of inserted and upserted documents, in operation order.
     pub fn batch(&self, ops: Vec<BatchOp>) -> Result<Vec<String>> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         let mut inserted = Vec::new();
         for op in ops {
             match op {
@@ -698,7 +763,11 @@ impl Db {
     }
 
     pub fn collections(&self) -> Result<Vec<CollectionInfo>> {
-        let txn = self.core.db.begin_read()?;
+        #[cfg(feature = "serve")]
+        if let Backend::Remote(r) = &self.backend {
+            return r.collections();
+        }
+        let txn = self.local()?.db.begin_read()?;
         let meta = match txn.open_table(META) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -732,7 +801,7 @@ impl Db {
     }
 
     fn update_meta(&self, collection: &str, f: impl FnOnce(&mut CollectionMeta)) -> Result<()> {
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
             let key = format!("{COLLECTION_PREFIX}{collection}");
@@ -837,24 +906,44 @@ fn matches_filter(doc: &Value, filter: &serde_json::Map<String, Value>) -> Resul
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
     retry_for: Option<std::time::Duration>,
+    #[cfg(feature = "serve")]
+    serve: ServeMode,
 }
 
 impl OpenOptions {
     /// Keep retrying a `database_locked` open with backoff for up to this
     /// long — the cure for two processes racing to open at cold start.
-    /// Any other error still fails immediately.
+    /// Any other error still fails immediately. Composes with `serve`:
+    /// each attempt tries discovery before counting as locked.
     pub fn retry_for(mut self, wait: std::time::Duration) -> Self {
         self.retry_for = Some(wait);
         self
     }
 
+    /// How this open relates to other processes on the same file — host
+    /// reads for them, discover a host when locked out, or both.
+    #[cfg(feature = "serve")]
+    pub fn serve(mut self, mode: ServeMode) -> Self {
+        self.serve = mode;
+        self
+    }
+
     /// Open a .tepin file with these options, creating it if absent.
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Db> {
-        let path = path.as_ref();
+        self.open_impl(path.as_ref(), false)
+    }
+
+    /// Open with these options, erroring (`file_not_found`) if the file
+    /// does not exist — the read-path variant, like [`Db::open_existing`].
+    pub fn open_existing(&self, path: impl AsRef<Path>) -> Result<Db> {
+        self.open_impl(path.as_ref(), true)
+    }
+
+    fn open_impl(&self, path: &Path, existing: bool) -> Result<Db> {
         let deadline = self.retry_for.map(|w| std::time::Instant::now() + w);
         let mut delay = std::time::Duration::from_millis(10);
         loop {
-            match Db::open(path) {
+            match self.open_once(path, existing) {
                 Err(e) if e.code == "database_locked" => {
                     let retry = deadline.is_some_and(|d| std::time::Instant::now() + delay <= d);
                     if !retry {
@@ -865,6 +954,41 @@ impl OpenOptions {
                 }
                 other => return other,
             }
+        }
+    }
+
+    #[allow(unused_mut)]
+    fn open_once(&self, path: &Path, existing: bool) -> Result<Db> {
+        let attempt = if existing {
+            Db::open_existing(path)
+        } else {
+            Db::open(path)
+        };
+        match attempt {
+            Ok(mut db) => {
+                #[cfg(feature = "serve")]
+                if matches!(self.serve, ServeMode::Host | ServeMode::HostOrDiscover) {
+                    db.host = Some(crate::serve::host::start(
+                        std::sync::Arc::clone(db.local()?),
+                        path,
+                    )?);
+                }
+                Ok(db)
+            }
+            Err(e) if e.code == "database_locked" => {
+                #[cfg(feature = "serve")]
+                if matches!(self.serve, ServeMode::Discover | ServeMode::HostOrDiscover) {
+                    if let Some(client) = crate::serve::client::discover(path)? {
+                        return Ok(Db {
+                            backend: Backend::Remote(client),
+                            embed: None,
+                            host: None,
+                        });
+                    }
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
         }
     }
 }

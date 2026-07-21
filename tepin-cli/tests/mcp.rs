@@ -173,3 +173,93 @@ fn mcp_state_persists_for_later_sessions() {
     let responses = session(&db, &[call(1, "query", json!({"collection": "kv"}))]);
     assert_eq!(text_json(&responses[0])["count"], 1);
 }
+
+/// The two-process serving loop, end to end with real binaries: an MCP
+/// server holds the file (and hosts reads), and CLI read commands in a
+/// second process are served instead of hitting database_locked — the
+/// exact Engram scenario from docs/serving.md.
+#[test]
+fn cli_reads_are_served_while_an_mcp_server_holds_the_file() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("live.tepin");
+    let ok = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .arg("insert")
+        .arg(&db)
+        .args(["notes", r#"{"_id": "n1", "title": "served read"}"#])
+        .output()
+        .unwrap();
+    assert!(ok.status.success());
+
+    // A long-lived MCP server takes the lock and hosts.
+    let mut server = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .arg("mcp")
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Wait until it answers — the host listener is up before stdio serves.
+    {
+        let stdin = server.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(server.stdout.as_mut().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(line.contains("\"id\":1"), "server did not answer: {line}");
+    }
+
+    // Second process: reads succeed (served), writes still refuse.
+    let out = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .args(["query"])
+        .arg(&db)
+        .args(["notes"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "served query failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["docs"][0]["title"], "served read");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .args(["inspect"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("notes"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .args(["insert"])
+        .arg(&db)
+        .args(["notes", r#"{"x": 1}"#])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "database_locked");
+
+    // Server exits on stdin EOF; the lock and sidecar go with it.
+    drop(server.stdin.take());
+    let status = server.wait().unwrap();
+    assert!(status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_tepin"))
+        .args(["insert"])
+        .arg(&db)
+        .args(["notes", r#"{"x": 1}"#])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "lock must be free after server exit");
+}

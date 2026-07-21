@@ -114,8 +114,8 @@ pub fn migrate_file(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<Migr
 
 /// One read snapshot of src, one atomic write transaction into dst.
 fn copy_all(src: &Db, dst: &Db, from_format: u32) -> Result<MigrateReport> {
-    let src_txn = src.core.db.begin_read()?;
-    let dst_txn = dst.core.db.begin_write()?;
+    let src_txn = src.local()?.db.begin_read()?;
+    let dst_txn = dst.local()?.db.begin_write()?;
     let mut documents = 0u64;
     let mut vector_rows = 0u64;
 
@@ -223,8 +223,8 @@ fn verify(src: &Db, dst: &Db) -> Result<()> {
             "the output file is incomplete — delete it and re-run; the original is untouched",
         )
     };
-    let src_txn = src.core.db.begin_read()?;
-    let dst_txn = dst.core.db.begin_read()?;
+    let src_txn = src.local()?.db.begin_read()?;
+    let dst_txn = dst.local()?.db.begin_read()?;
     for col in src.collections()? {
         let src_docs = match src_txn.open_table(byte_def(&data_table(&col.name))) {
             Ok(t) => Some(t),
@@ -276,7 +276,7 @@ mod tests {
             db.set_vectors("notes", "n1", "m", &[vec![1.0, 0.0]])
                 .unwrap();
             // Rewrite the row the way pre-chunking builds keyed it.
-            let txn = db.core.db.begin_write().unwrap();
+            let txn = db.local().unwrap().db.begin_write().unwrap();
             {
                 let mut vecs = txn.open_table(byte_def(&vec_table("notes"))).unwrap();
                 let bytes = {
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(report.vector_rows, 1);
 
         let db = Db::open(&dst).unwrap();
-        let txn = db.core.db.begin_read().unwrap();
+        let txn = db.local().unwrap().db.begin_read().unwrap();
         let vecs = txn.open_table(byte_def(&vec_table("notes"))).unwrap();
         assert!(vecs.get("n1").unwrap().is_none(), "legacy key must be gone");
         assert!(vecs.get(chunk_key("n1", 0).as_str()).unwrap().is_some());

@@ -16,7 +16,11 @@ use serde_json::{json, Value};
 use tepin_core::{Db, TepinError};
 
 pub fn serve(file: &Path) -> Result<(), TepinError> {
-    let mut db = Db::open(file)?;
+    // The MCP server is the long-lived lock holder in practice (e.g. an
+    // agent session on a live database) — host reads for everyone else.
+    let mut db = Db::options()
+        .serve(tepin_core::ServeMode::Host)
+        .open(file)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
 

@@ -65,7 +65,7 @@ struct EmbedderInfo {
 /// that chunk's text verbatim — the relevant excerpt, not the whole blob.
 /// `truncated` surfaces loud truncation from write time (rare with
 /// chunking: an over-dense single chunk, or a doc past the chunk cap).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
     pub collection: String,
     pub id: String,
@@ -82,7 +82,7 @@ pub struct SearchHit {
 
 /// One raw vector-search hit (the primitives tier): the document's
 /// best-matching chunk by cosine, no keyword fusion, no doc fetch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
     pub collection: String,
     pub id: String,
@@ -93,7 +93,7 @@ pub struct VectorHit {
 
 /// One raw BM25 keyword hit (the primitives tier). Scores are comparable
 /// within one collection; across collections they are raw BM25 sums.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeywordHit {
     pub collection: String,
     pub id: String,
@@ -120,21 +120,21 @@ impl StoredError {
     }
 }
 
-struct WorkerState {
+pub(crate) struct WorkerState {
     wake: bool,
     shutdown: bool,
     processed: u64,
     last_error: Option<StoredError>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     state: Mutex<WorkerState>,
     cond: Condvar,
 }
 
 pub(crate) struct EmbedRuntime {
     pub(crate) embedder: Arc<dyn Embedder>,
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -143,15 +143,29 @@ impl EmbedRuntime {
         self.shared.state.lock().unwrap().wake = true;
         self.shared.cond.notify_all();
     }
+
+    /// A worker-less view of a running pipeline, for the serving host: it
+    /// can nudge, flush, and search through the owner's worker, and its
+    /// Drop is a no-op (the worker is not its to stop).
+    #[cfg(feature = "serve")]
+    pub(crate) fn borrowed(embedder: Arc<dyn Embedder>, shared: Arc<Shared>) -> Self {
+        Self {
+            embedder,
+            shared,
+            worker: None,
+        }
+    }
 }
 
 impl Drop for EmbedRuntime {
     fn drop(&mut self) {
+        // Borrowed views (worker: None) must not stop the real worker.
+        let Some(handle) = self.worker.take() else {
+            return;
+        };
         self.shared.state.lock().unwrap().shutdown = true;
         self.shared.cond.notify_all();
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        let _ = handle.join();
     }
 }
 
@@ -197,7 +211,7 @@ impl Db {
         let worker = std::thread::Builder::new()
             .name("tepin-embed-worker".into())
             .spawn({
-                let core = Arc::clone(&self.core);
+                let core = Arc::clone(self.local()?);
                 let embedder = Arc::clone(&embedder);
                 let shared = Arc::clone(&shared);
                 move || worker_loop(&core, embedder.as_ref(), &shared)
@@ -205,10 +219,15 @@ impl Db {
             .expect("spawn embed worker");
 
         self.embed = Some(EmbedRuntime {
-            embedder,
-            shared,
+            embedder: Arc::clone(&embedder),
+            shared: Arc::clone(&shared),
             worker: Some(worker),
         });
+        // A hosting handle now serves real semantic search too.
+        #[cfg(feature = "serve")]
+        if let Some(host) = &self.host {
+            host.register_embedder(embedder, shared);
+        }
         Ok(())
     }
 
@@ -233,7 +252,7 @@ impl Db {
 
     fn configure_embed(&self, collection: &str, fields: &[&str], manual: bool) -> Result<()> {
         validate_collection_name(collection)?;
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
             let key = format!("{COLLECTION_PREFIX}{collection}");
@@ -289,7 +308,7 @@ impl Db {
 
     /// How many documents still await embedding (the backfill/progress gauge).
     pub fn pending_embeddings(&self) -> Result<u64> {
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         match txn.open_table(PENDING) {
             Ok(t) => Ok(t.len()?),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
@@ -339,6 +358,10 @@ impl Db {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        #[cfg(feature = "serve")]
+        if let crate::db::Backend::Remote(r) = &self.backend {
+            return r.search(collection, query, limit);
+        }
         let rt = self.embed.as_ref().ok_or_else(|| {
             TepinError::new(
                 "embedder_not_attached",
@@ -350,7 +373,7 @@ impl Db {
         let query_embedding = rt.embedder.embed(query)?;
         let dim = rt.embedder.dim();
 
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         let all = self.collections()?;
         let targets = embedded_targets(&all, collection)?;
 
@@ -464,7 +487,7 @@ impl Db {
             ));
         }
 
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let cm = crate::db::collection_meta_in_txn(&txn, collection)?;
             if !cm.manual_vectors {
@@ -538,10 +561,14 @@ impl Db {
     /// Read a document's stored vectors back, ordered by chunk index.
     /// Empty when the document has no vectors (yet).
     pub fn get_vectors(&self, collection: &str, id: &str) -> Result<Vec<Vec<f32>>> {
+        #[cfg(feature = "serve")]
+        if let crate::db::Backend::Remote(r) = &self.backend {
+            return r.get_vectors(collection, id);
+        }
         let Some(info) = self.stored_embedder_info()? else {
             return Ok(Vec::new());
         };
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         let vec_name = vec_table(collection);
         let def: TableDefinition<&str, &[u8]> = TableDefinition::new(&vec_name);
         let table = match txn.open_table(def) {
@@ -577,6 +604,10 @@ impl Db {
         query: &[f32],
         limit: usize,
     ) -> Result<Vec<VectorHit>> {
+        #[cfg(feature = "serve")]
+        if let crate::db::Backend::Remote(r) = &self.backend {
+            return r.search_by_vector(collection, query, limit);
+        }
         let Some(info) = self.stored_embedder_info()? else {
             return Ok(Vec::new());
         };
@@ -591,7 +622,7 @@ impl Db {
                 "produce the query vector with the same model that produced the stored vectors",
             ));
         }
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         let all = self.collections()?;
         let targets = embedded_targets(&all, collection)?;
         let mut hits = Vec::new();
@@ -623,7 +654,11 @@ impl Db {
         query: &str,
         limit: usize,
     ) -> Result<Vec<KeywordHit>> {
-        let txn = self.core.db.begin_read()?;
+        #[cfg(feature = "serve")]
+        if let crate::db::Backend::Remote(r) = &self.backend {
+            return r.keyword_search(collection, query, limit);
+        }
+        let txn = self.local()?.db.begin_read()?;
         let all = self.collections()?;
         let targets = embedded_targets(&all, collection)?;
         let terms = crate::fts::tokenize(query);
@@ -664,7 +699,7 @@ impl Db {
             ));
         }
         let all = self.collections()?;
-        let txn = self.core.db.begin_write()?;
+        let txn = self.local()?.db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
             meta.remove(EMBEDDER_KEY)?;
@@ -702,7 +737,7 @@ impl Db {
     }
 
     fn stored_embedder_info(&self) -> Result<Option<EmbedderInfo>> {
-        let txn = self.core.db.begin_read()?;
+        let txn = self.local()?.db.begin_read()?;
         let meta = match txn.open_table(META) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
