@@ -1,0 +1,3 @@
+# gofmt requires LF; a CRLF checkout on Windows makes `gofmt -l` flag
+# every file as unformatted.
+*.go text eol=lf

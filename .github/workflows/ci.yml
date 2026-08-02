@@ -84,8 +84,10 @@ jobs:
                      echo "node=$PWD/target/debug/libtepin_node.dylib" >> "$GITHUB_OUTPUT" ;;
             Linux)   echo "ffi=$PWD/target/debug/libtepin_ffi.so" >> "$GITHUB_OUTPUT"
                      echo "node=$PWD/target/debug/libtepin_node.so" >> "$GITHUB_OUTPUT" ;;
-            Windows) echo "ffi=$PWD/target/debug/tepin_ffi.dll" >> "$GITHUB_OUTPUT"
-                     echo "node=$PWD/target/debug/tepin_node.dll" >> "$GITHUB_OUTPUT" ;;
+            # cygpath: Windows Go/Node binaries cannot open MSYS /d/a/… paths.
+            Windows) P=$(cygpath -m "$PWD")
+                     echo "ffi=$P/target/debug/tepin_ffi.dll" >> "$GITHUB_OUTPUT"
+                     echo "node=$P/target/debug/tepin_node.dll" >> "$GITHUB_OUTPUT" ;;
           esac
       - uses: actions/setup-go@v6
         with:
