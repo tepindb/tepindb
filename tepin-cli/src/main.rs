@@ -163,7 +163,10 @@ fn run(cli: Cli) -> Result<(), TepinError> {
     match cli.command {
         Command::Inspect { file } => {
             let db = open_read(&file.file)?;
-            print!("{}", inspect_markdown(&db, &file.file)?);
+            print!(
+                "{}",
+                tepin_core::ops::inspect_markdown(&db, Some(&file.file))?
+            );
         }
         Command::Query {
             file,
@@ -307,54 +310,4 @@ fn open_read(path: &std::path::Path) -> Result<Db, TepinError> {
 
 fn emit(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
-}
-
-pub(crate) fn inspect_markdown(db: &Db, path: &std::path::Path) -> Result<String, TepinError> {
-    use std::fmt::Write;
-    let cols = db.collections()?;
-    let total: u64 = cols.iter().map(|c| c.count).sum();
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-    let mut md = String::new();
-    let _ = writeln!(md, "# TepinDB — {}\n", path.display());
-    let _ = writeln!(
-        md,
-        "Format v{} · {} collection(s) · {} document(s) · {:.1} KiB\n",
-        tepin_core::format::FORMAT_VERSION,
-        cols.len(),
-        total,
-        size as f64 / 1024.0
-    );
-    if cols.is_empty() {
-        let _ = writeln!(
-            md,
-            "This database is empty. Create a collection by inserting:\n\n\
-             ```\ntepin insert {} <collection> '{{\"any\": \"json\"}}'\n```",
-            path.display()
-        );
-    } else {
-        let _ = writeln!(md, "| collection | docs | embedded fields | purpose |");
-        let _ = writeln!(md, "|---|---:|---|---|");
-        for c in &cols {
-            let _ = writeln!(
-                md,
-                "| {} | {} | {} | {} |",
-                c.name,
-                c.count,
-                if c.embed.is_empty() {
-                    "—".to_string()
-                } else {
-                    c.embed.join(", ")
-                },
-                c.purpose.as_deref().unwrap_or("—")
-            );
-        }
-        let _ = writeln!(
-            md,
-            "\nQuery any collection with MongoDB-style filters:\n\n\
-             ```\ntepin query {} <collection> '{{\"field\": \"value\"}}'\n```",
-            path.display()
-        );
-    }
-    Ok(md)
 }

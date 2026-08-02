@@ -21,8 +21,20 @@
   "bin": {
     "tepin": "bin/tepin.js"
   },
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
   "files": [
-    "bin"
+    "bin",
+    "lib"
   ],
   "engines": {
     "node": ">=22"

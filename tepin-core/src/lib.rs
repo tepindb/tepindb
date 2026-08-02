@@ -26,6 +26,7 @@ mod fts;
 mod id;
 mod index;
 pub mod migrate;
+pub mod ops;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
 mod vector;

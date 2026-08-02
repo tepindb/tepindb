@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tepin-core", "tepin-embed", "tepin-cli", "tepindb", "tepin", "examples/notes-app"]
+members = ["tepin-core", "tepin-embed", "tepin-cli", "tepindb", "tepin", "tepin-ffi", "tepin-node", "examples/notes-app"]
 exclude = ["fuzz"]
 
 [workspace.package]

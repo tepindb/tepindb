@@ -1,0 +1,29 @@
+[package]
+name = "tepin-node"
+description = "AI-first single-file database — the Node.js addon behind the tepindb TypeScript driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Ships as a prebuilt tepin.node inside the tepindb-<platform> npm
+# packages, never on crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["embedding"]
+embedding = ["tepin-ffi/embedding"]
+
+[dependencies]
+tepin-ffi = { path = "../tepin-ffi", version = "0.1.0", default-features = false }
+tepin-core = { path = "../tepin-core", version = "0.1.0" }
+serde_json = { workspace = true }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

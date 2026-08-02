@@ -1,0 +1,32 @@
+[package]
+name = "tepin-ffi"
+description = "AI-first single-file database — the libtepin C ABI behind the Go and TypeScript drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+# Distributed as prebuilt libtepin artifacts on GitHub releases, not on
+# crates.io — the drivers pin those artifacts by SHA-256.
+publish = false
+
+# The built artifact is libtepin_ffi.<ext>; release packaging ships it
+# as libtepin-<target>.<ext> on GitHub releases.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Full build: `embedder: "auto"` in open options wires up bge-small
+# (lazy, SHA-256-pinned download on first embed). Disable for a slim
+# document-store-only library.
+default = ["embedding"]
+embedding = ["tepin-embed/onnx"]
+
+[dependencies]
+tepin-core = { path = "../tepin-core", version = "0.1.0" }
+tepin-embed = { path = "../tepin-embed", version = "0.1.0" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

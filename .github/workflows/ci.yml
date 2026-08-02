@@ -49,6 +49,66 @@ jobs:
       # The slim (npx) build must keep compiling warning-free too.
       - run: cargo clippy -p tepin-cli --no-default-features --all-targets -- -D warnings
 
+  drivers:
+    # The Go and TypeScript drivers, end-to-end against a freshly built
+    # engine: cargo builds libtepin_ffi (Go, via purego) and tepin-node
+    # (napi addon), then each driver's own test suite runs through it.
+    name: drivers (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Use dynamic CRT for C/C++ deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "CFLAGS=/MD" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=/MD" >> "$GITHUB_ENV"
+      # Slim engines: the drivers' CRUD/search-free surface needs no ONNX,
+      # and the full build already compiles in the test matrix.
+      - name: Build engine libraries
+        run: |
+          cargo build -p tepin-ffi --no-default-features
+          cargo build -p tepin-node --no-default-features
+      - name: Resolve library paths
+        id: libs
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS)   echo "ffi=$PWD/target/debug/libtepin_ffi.dylib" >> "$GITHUB_OUTPUT"
+                     echo "node=$PWD/target/debug/libtepin_node.dylib" >> "$GITHUB_OUTPUT" ;;
+            Linux)   echo "ffi=$PWD/target/debug/libtepin_ffi.so" >> "$GITHUB_OUTPUT"
+                     echo "node=$PWD/target/debug/libtepin_node.so" >> "$GITHUB_OUTPUT" ;;
+            Windows) echo "ffi=$PWD/target/debug/tepin_ffi.dll" >> "$GITHUB_OUTPUT"
+                     echo "node=$PWD/target/debug/tepin_node.dll" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: tepin-go/go.sum
+      - name: Go driver — vet + test
+        shell: bash
+        env:
+          TEPIN_LIB: ${{ steps.libs.outputs.ffi }}
+        run: |
+          cd tepin-go
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: TypeScript driver — test
+        shell: bash
+        env:
+          TEPIN_NODE_ADDON: ${{ steps.libs.outputs.node }}
+        run: cd npm/tepindb && node --test
+
   lint:
     # Non-Rust linters (Rust fmt/clippy run in the test matrix):
     # shellcheck for shell scripts, actionlint for workflows (it also

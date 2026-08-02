@@ -111,7 +111,7 @@ fn dispatch(db: &mut Db, file: &Path, name: &str, args: &Value) -> Result<String
     };
 
     match name {
-        "inspect" => crate::inspect_markdown(db, file),
+        "inspect" => tepin_core::ops::inspect_markdown(db, Some(file)),
         "query" => {
             let filter = args.get("filter").cloned().unwrap_or_else(|| json!({}));
             let docs = db.find(collection()?, &filter)?;

@@ -212,26 +212,6 @@ fn shim_db(state: &HostState) -> Result<Db> {
 }
 
 fn dispatch(state: &HostState, op: &str, args: &Value) -> Result<Value> {
-    let collection = || -> Result<&str> {
-        args["collection"].as_str().ok_or_else(|| {
-            TepinError::new(
-                "invalid_filter",
-                "missing required string argument 'collection'",
-                "pass the collection name",
-            )
-        })
-    };
-    let id_arg = || -> Result<&str> {
-        args["id"].as_str().ok_or_else(|| {
-            TepinError::new(
-                "doc_not_found",
-                "missing required string argument 'id'",
-                "pass the document's _id",
-            )
-        })
-    };
-    let limit = || args["limit"].as_u64().unwrap_or(5) as usize;
-
     match op {
         "hello" => {
             let client_protocol = args["protocol_version"].as_u64().unwrap_or(0) as u32;
@@ -251,36 +231,12 @@ fn dispatch(state: &HostState, op: &str, args: &Value) -> Result<Value> {
                 "pid": std::process::id(),
             }))
         }
-        "collections" => Ok(json!({"collections": shim_db(state)?.collections()?})),
-        "query" => {
-            let filter = args.get("filter").cloned().unwrap_or_else(|| json!({}));
-            Ok(json!({"docs": shim_db(state)?.find(collection()?, &filter)?}))
+        "collections" | "query" | "get" | "search" | "keyword_search" | "search_by_vector"
+        | "get_vectors" | "pending_embeddings" => {
+            crate::ops::dispatch(&shim_db(state)?, op, args)
         }
-        "get" => Ok(json!({"doc": shim_db(state)?.get(collection()?, id_arg()?)?})),
-        "search" => {
-            let query = args["query"].as_str().unwrap_or_default();
-            let hits = shim_db(state)?.search(args["collection"].as_str(), query, limit())?;
-            Ok(json!({"hits": hits}))
-        }
-        "keyword_search" => {
-            let query = args["query"].as_str().unwrap_or_default();
-            let hits =
-                shim_db(state)?.keyword_search(args["collection"].as_str(), query, limit())?;
-            Ok(json!({"hits": hits}))
-        }
-        "search_by_vector" => {
-            let vector: Vec<f32> = args["vector"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect())
-                .unwrap_or_default();
-            let hits =
-                shim_db(state)?.search_by_vector(args["collection"].as_str(), &vector, limit())?;
-            Ok(json!({"hits": hits}))
-        }
-        "get_vectors" => Ok(
-            json!({"vectors": shim_db(state)?.get_vectors(collection()?, id_arg()?)?}),
-        ),
-        "insert" | "upsert" | "update" | "delete" | "purpose" | "embed_fields" => {
+        "insert" | "upsert" | "update" | "delete" | "purpose" | "embed_fields" | "batch"
+        | "create_index" | "drop_index" | "manual_vectors" | "set_vectors" => {
             Err(TepinError::new(
                 "database_locked",
                 "another process holds the write lock; served handles are read-only",

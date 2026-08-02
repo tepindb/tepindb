@@ -26,6 +26,13 @@ tepin mcp    memory.tepin            # plug the db into an AI agent (MCP)
   excerpt as a `snippet`. No chunking code in your app, ever.
 - **Made for agents** — self-describing file, MCP tools, MongoDB-style
   filters, every error carries `{code, message, hint}`.
+- **Go and TypeScript drivers** — same verbs as the CLI and MCP server,
+  in-process over one C ABI (no cgo, no daemon). Driver errors carry the
+  exact `tepin …` CLI command that reproduces the failing call, and
+  `TEPIN_TRACE=1` traces every op in every language. `npm i tepindb`
+  gives `import { open } from "tepindb"`;
+  `go get github.com/tepindb/tepindb/tepin-go` gives the pure-Go driver
+  (SHA-256-pinned engine download). Design: [docs/drivers.md](docs/drivers.md).
 - **Multi-process reads via in-driver serving** — one process writes; when
   it opens with `ServeMode::Host` (as `tepin mcp` does), other processes'
   reads are served through it with snapshot isolation. `tepin inspect` /
