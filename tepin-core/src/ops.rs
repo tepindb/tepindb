@@ -42,7 +42,7 @@ pub const OPS: &[&str] = &[
     "get_vectors",
 ];
 
-fn tracing() -> bool {
+pub(crate) fn tracing() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("TEPIN_TRACE")

@@ -168,6 +168,22 @@ enum Backend {
 5. Stale (dead pid / bad nonce) → delete the stale sidecar, then return
    `database_locked` (or, if `create`-ish semantics apply, take the lock).
 
+### Engine settings do not cross the socket
+
+A `Remote` handle owns no engine, so every `Db::options()` setting that
+configures the *storage engine* applies only when this process wins the lock.
+Today that is `cache_size`: the page cache lives in whichever process holds the
+file, with the ceiling **that** process asked for, so a discovering client's
+`.cache_size(…)` governs nothing. It is not an error — the same call site can
+win the lock on the next run, and failing an otherwise-successful open because
+a race went the other way would be worse than the no-op. `Db::is_served()` tells
+you which handle you got; with `TEPIN_TRACE` set, the fall-through prints a
+`tepin_trace` note naming the ignored setting.
+
+`retry_for` is unaffected (it governs the attempt, not the engine), and a
+`Host` handle's cache is simply its own local engine's — it serves reads out of
+the cache it configured.
+
 ## Enablement & the embedded-purity tension
 
 An always-listening socket on every write-open would violate the "single file,

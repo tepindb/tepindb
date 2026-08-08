@@ -267,7 +267,20 @@ impl Db {
     /// Open a .tepin file, creating it (with its preamble) if absent.
     /// Opening never blocks on anything heavy — models load elsewhere, later.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_with(path.as_ref(), false, None)
+    }
+
+    /// The one real open. `existing` is the [`Db::open_existing`] check
+    /// (a missing file is an error, not a fresh database); `cache_size` is
+    /// [`OpenOptions::cache_size`], `None` meaning "leave redb's default".
+    fn open_with(path: &Path, existing: bool, cache_size: Option<usize>) -> Result<Self> {
+        if existing && !path.exists() {
+            return Err(TepinError::new(
+                "file_not_found",
+                format!("no database file at {}", path.display()),
+                "check the path (an explicit file argument overrides TEPIN_DB); a new db is created by `tepin insert`",
+            ));
+        }
         let is_new = !path.exists() || std::fs::metadata(path)?.len() == 0;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -299,13 +312,23 @@ impl Db {
             format::parse_preamble(&head)?;
         }
 
-        let db = redb::Builder::new().create_with_backend(PreambleBackend::new(file))?;
+        let mut builder = redb::Builder::new();
+        if let Some(bytes) = cache_size {
+            builder.set_cache_size(bytes);
+        }
+        let db = builder.create_with_backend(PreambleBackend::new(file))?;
         Ok(Self::from_core(Core { db }))
     }
 
     /// Open a fresh in-memory database: full engine, zero disk. Made for
     /// test suites and ephemeral scratch stores; everything vanishes on
     /// drop. No file, no preamble, no lock.
+    ///
+    /// Deliberately knob-free: [`OpenOptions`] is the *file* builder (retry
+    /// and serve are both lock concepts), and an in-memory database's pages
+    /// already live in memory — redb's cache only double-buffers a dataset
+    /// this process is holding anyway, bounded by that dataset's own size.
+    /// If an embedder ever needs the ceiling here, it gets its own builder.
     pub fn open_in_memory() -> Result<Self> {
         let db = redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?;
         Ok(Self::from_core(Core { db }))
@@ -314,15 +337,7 @@ impl Db {
     /// Open a .tepin file that must already exist — the read-path variant:
     /// a typo'd path is an error, never a silently created empty database.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Err(TepinError::new(
-                "file_not_found",
-                format!("no database file at {}", path.display()),
-                "check the path (an explicit file argument overrides TEPIN_DB); a new db is created by `tepin insert`",
-            ));
-        }
-        Self::open(path)
+        Self::open_with(path.as_ref(), true, None)
     }
 
     /// Start building an open call with options — retry, and (eventually)
@@ -900,6 +915,7 @@ fn matches_filter(doc: &Value, filter: &serde_json::Map<String, Value>) -> Resul
 /// # use std::time::Duration;
 /// let db = Db::options()
 ///     .retry_for(Duration::from_secs(2))
+///     .cache_size(64 * 1024 * 1024)
 ///     .open("memory.tepin")?;
 /// # Ok::<(), tepin_core::TepinError>(())
 /// ```
@@ -908,6 +924,7 @@ pub struct OpenOptions {
     retry_for: Option<std::time::Duration>,
     #[cfg(feature = "serve")]
     serve: ServeMode,
+    cache_size: Option<usize>,
 }
 
 impl OpenOptions {
@@ -925,6 +942,43 @@ impl OpenOptions {
     #[cfg(feature = "serve")]
     pub fn serve(mut self, mode: ServeMode) -> Self {
         self.serve = mode;
+        self
+    }
+
+    /// Cap the storage engine's page cache at `bytes`.
+    ///
+    /// This is a **ceiling, not a reservation**: redb fills the cache
+    /// lazily as pages are read and evicts to stay under the limit, and it
+    /// can never exceed the database file's own size. Setting it does not
+    /// shrink a running process, and setting it large does not allocate
+    /// anything up front — it bounds the worst case, which is what matters
+    /// for an embedder sharing a long-lived process with other memory
+    /// consumers.
+    ///
+    /// Unset means redb's own default ceiling (1 GiB in redb 4.1) —
+    /// tepindb deliberately does not substitute a lower default, so open
+    /// behavior is unchanged for everyone who does not ask.
+    ///
+    /// A tiny cache stays *correct*, only slower: reads that miss go to
+    /// the file. There is no minimum, and `0` is legal.
+    ///
+    /// **With `serve`:** this configures the engine *this* handle opens.
+    /// If the file is locked and `ServeMode::Discover`/`HostOrDiscover`
+    /// finds a host, the returned handle reads through that host's engine
+    /// and this setting does nothing — the cache lives in the host
+    /// process, which set its own ceiling when it won the lock. Check
+    /// [`Db::is_served`] if you need to know which you got; with
+    /// `TEPIN_TRACE` on, the fall-through says so on stderr.
+    ///
+    /// ```no_run
+    /// # use tepin_core::Db;
+    /// let db = Db::options()
+    ///     .cache_size(64 * 1024 * 1024)
+    ///     .open("memory.tepin")?;
+    /// # Ok::<(), tepin_core::TepinError>(())
+    /// ```
+    pub fn cache_size(mut self, bytes: usize) -> Self {
+        self.cache_size = Some(bytes);
         self
     }
 
@@ -959,11 +1013,7 @@ impl OpenOptions {
 
     #[allow(unused_mut)]
     fn open_once(&self, path: &Path, existing: bool) -> Result<Db> {
-        let attempt = if existing {
-            Db::open_existing(path)
-        } else {
-            Db::open(path)
-        };
+        let attempt = Db::open_with(path, existing, self.cache_size);
         match attempt {
             Ok(mut db) => {
                 #[cfg(feature = "serve")]
@@ -979,6 +1029,17 @@ impl OpenOptions {
                 #[cfg(feature = "serve")]
                 if matches!(self.serve, ServeMode::Discover | ServeMode::HostOrDiscover) {
                     if let Some(client) = crate::serve::client::discover(path)? {
+                        // The engine — and with it the page cache — lives in
+                        // the host process; our ceiling applies to nothing.
+                        if self.cache_size.is_some() && crate::ops::tracing() {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({"tepin_trace": {
+                                    "note": "cache_size ignored: this handle reads through a serving host, whose engine holds the cache",
+                                    "path": path.display().to_string(),
+                                }})
+                            );
+                        }
                         return Ok(Db {
                             backend: Backend::Remote(client),
                             embed: None,
@@ -1083,6 +1144,102 @@ mod tests {
         assert_eq!(cols[0].name, "notes");
         assert_eq!(cols[0].count, 2);
         assert_eq!(cols[0].purpose.as_deref(), Some("scratch notes for tests"));
+    }
+
+    /// redb exposes no getter for its cache ceiling, so the option is
+    /// observed where it bites: a page redb keeps cached is a page the
+    /// storage backend is never asked to read again.
+    #[test]
+    fn cache_size_reaches_redb_and_unset_keeps_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(4096);
+
+        // A cache of zero forces every read down to the file.
+        let starved = dir.path().join("starved.tepin");
+        let reads = crate::format::count_reads();
+        let db = Db::options().cache_size(0).open(&starved).unwrap();
+        let id = db.insert("notes", json!({"body": big})).unwrap();
+        db.get("notes", &id).unwrap().unwrap();
+        let before = reads.load(std::sync::atomic::Ordering::Relaxed);
+        db.get("notes", &id).unwrap().unwrap();
+        let starved_reads = reads.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(
+            starved_reads > 0,
+            "cache_size(0) must reach redb: a re-read hit the backend {starved_reads} times"
+        );
+
+        // Unset: redb's own default ceiling, so the same re-read is served
+        // from cache. Same workload, same assertions, no option set.
+        let default = dir.path().join("default.tepin");
+        let reads = crate::format::count_reads();
+        let db = Db::options().open(&default).unwrap();
+        let id = db.insert("notes", json!({"body": big})).unwrap();
+        db.get("notes", &id).unwrap().unwrap();
+        let before = reads.load(std::sync::atomic::Ordering::Relaxed);
+        db.get("notes", &id).unwrap().unwrap();
+        let default_reads = reads.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(
+            default_reads, 0,
+            "unset must leave redb's default cache in place"
+        );
+
+        // And the plain constructor is on that same default path.
+        let plain = dir.path().join("plain.tepin");
+        let reads = crate::format::count_reads();
+        let db = Db::open(&plain).unwrap();
+        let id = db.insert("notes", json!({"body": big})).unwrap();
+        db.get("notes", &id).unwrap().unwrap();
+        let before = reads.load(std::sync::atomic::Ordering::Relaxed);
+        db.get("notes", &id).unwrap().unwrap();
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed) - before,
+            0,
+            "Db::open must keep passing None"
+        );
+        assert!(Db::options().cache_size.is_none());
+    }
+
+    /// A cache far smaller than the working set is only slower, never
+    /// wrong — redb's own suite runs at 12686 bytes, so we do too.
+    #[test]
+    fn a_tiny_cache_still_reads_and_writes_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.tepin");
+        let body = "y".repeat(2048);
+
+        let ids = {
+            let db = Db::options().cache_size(12686).open(&path).unwrap();
+            let docs: Vec<Value> = (0..300)
+                .map(|i| json!({"i": i, "body": body.clone()}))
+                .collect();
+            let ids = db.insert_many("notes", docs).unwrap();
+            assert_eq!(ids.len(), 300);
+            for (i, id) in ids.iter().enumerate() {
+                assert_eq!(db.get("notes", id).unwrap().unwrap()["i"], json!(i));
+            }
+            db.update("notes", &ids[7], json!({"i": 7, "body": "small"}))
+                .unwrap();
+            db.delete("notes", &ids[9]).unwrap();
+            ids
+        };
+
+        // Reopened at the same ceiling: everything the tiny cache wrote is
+        // there, and the file itself is far larger than the cache.
+        let db = Db::options().cache_size(12686).open(&path).unwrap();
+        assert_eq!(db.collections().unwrap()[0].count, 299);
+        assert_eq!(db.get("notes", &ids[7]).unwrap().unwrap()["body"], "small");
+        assert_eq!(db.get("notes", &ids[9]).unwrap(), None);
+        assert_eq!(
+            db.get("notes", &ids[299]).unwrap().unwrap()["i"],
+            json!(299)
+        );
+        assert_eq!(
+            db.find("notes", &json!({"i": {"$gte": 100}}))
+                .unwrap()
+                .len(),
+            200
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() > 12686 * 4);
     }
 
     #[test]

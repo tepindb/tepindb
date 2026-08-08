@@ -226,6 +226,33 @@ fn stale_sidecar_is_cleaned_and_reported_as_locked() {
     assert!(!sidecar_file.exists(), "stale sidecar must be cleaned up");
 }
 
+/// A cache ceiling is an engine setting, and a discovered handle has no
+/// engine — the open still succeeds (the setting simply governs nothing),
+/// because failing a working open over a lost lock race would be worse.
+#[test]
+fn cache_size_is_inert_but_never_fatal_on_a_served_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cached.tepin");
+    let host = Db::options()
+        .serve(ServeMode::Host)
+        .cache_size(8 * 1024 * 1024)
+        .open(&path)
+        .expect("host open with a cache ceiling");
+    host.insert("nodes", json!({"_id": "n1", "title": "first"}))
+        .unwrap();
+
+    let reader = Db::options()
+        .serve(ServeMode::Discover)
+        .cache_size(1024)
+        .open_existing(&path)
+        .expect("discovery must not fail because a cache ceiling was asked for");
+    assert!(reader.is_served());
+    assert_eq!(
+        reader.get("nodes", "n1").unwrap().unwrap()["title"],
+        "first"
+    );
+}
+
 #[test]
 fn serve_off_advertises_nothing() {
     let dir = tempfile::tempdir().unwrap();

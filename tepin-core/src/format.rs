@@ -168,12 +168,36 @@ pub fn parse_preamble(bytes: &[u8]) -> Result<PreambleMeta> {
 #[derive(Debug)]
 pub struct PreambleBackend {
     file: File,
+    /// Test-only read counter, armed via [`count_reads`]. A page redb has
+    /// cached never reaches the backend, so counting these is how the
+    /// cache-size tests observe a setting redb exposes no getter for.
+    #[cfg(test)]
+    reads: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl PreambleBackend {
     pub fn new(file: File) -> Self {
-        Self { file }
+        Self {
+            file,
+            #[cfg(test)]
+            reads: PENDING_COUNTER.with(|c| c.borrow_mut().take()),
+        }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_COUNTER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm the next backend built on this thread to count its reads. Returns
+/// the counter; the arming is consumed by the first `PreambleBackend::new`.
+#[cfg(test)]
+pub(crate) fn count_reads() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    PENDING_COUNTER.with(|c| *c.borrow_mut() = Some(std::sync::Arc::clone(&counter)));
+    counter
 }
 
 #[cfg(unix)]
@@ -228,6 +252,10 @@ impl redb::StorageBackend for PreambleBackend {
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(reads) = &self.reads {
+            reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         read_at(&self.file, out, offset + PREAMBLE_LEN)
     }
 
